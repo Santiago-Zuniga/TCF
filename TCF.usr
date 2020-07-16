@@ -1,0 +1,2523 @@
+c- Spatially evolving turbidity currents, both in periodic channels or canyon-fan transitions 
+c- Simulation parameters -----------------------------------------------------------
+#define RITAU uparam(1)                         /* Ri_tau */
+#define V_SETTLING uparam(3)                    /* Settling velocity (positive)*/
+#define DIAM uparam(4)                          /* Nondimensional particle diameter */ 
+#define BC_FLAG_TEMP uparam(6)                  /*0-> Depositional grad(T) dot n=0, 1-> Bypass mode: (1/Pe)*grad(T) dot n = -|Vs*T| dot n  2-> Parker erosion: (1/Pe)*grad(T) dot n = |Vs*Es| dot n */
+
+#define RE_TAU (1/param(2))                     /* Re_tau */
+#define PACKING_FR 0.6
+#define RE_P ((RE_TAU*DIAM*V_SETTLING*18.0)**0.5)                /*Particle Reynolds number*/
+#define Cv RE_TAU*DIAM**2/(18*V_SETTLING*sin(atan(1/RITAU)))     /*Volume mean concentration*/
+
+c- Exner equation parameters -----------------------------------------------
+#define THRESHOLD 0.001                        /*concentration integration threshold */
+#define EPS_EXNER 0.010                        /*epsilon for numerical diffusion in Exner equation*/
+#define STD_EXNER_QX 3.5                       /*Gaussian filter standard deviation for div q, as a fraction of the elements size*/
+#define STD_EXNER_QZ 3.5                       /*Gaussian filter standard deviation for div q, as a fraction of the elements size*/
+#define MV_STEP 10                             /*Mesh eigenvalues will be updated every MV_STEP steps*/
+#define IN_ZL 10.0                             /*Inlet zone for Exner equation*/
+#define OUT_ZL 40.0                            /*Outlet zone for Exner equation*/
+
+c- I/O parameters -----------------------------------------------------------
+#define restart_bed uparam(12)                    /* whether to read bedform.ini for restasting */
+#define restart_means abs(uparam(13))/uparam(13)  /* whether to read means.ini for means restasting (>0)*/
+#define iostep_2d_avg_time  abs(uparam(13))       /* output frequency for spanwise-time-averaged statistics */
+#define mean_time_start abs(uparam(14))           /* start time for means accumulation */
+#define iostep_2d_notime uparam(15)               /* output frequency for spanwise-averaged statistics*/
+#define iostep_bed abs(uparam(16))                /* output frequency for bedform file, if uparam(16) lt 0, bedform calculations are skipped*/
+
+c - mesh and buffer zones dimensions
+#define PI (4.*atan(1.))
+#define XLEN (uparam(7)*PI)
+#define YLEN uparam(8)
+#define ZLEN (uparam(9)*PI)
+#define NUMBER_ELEMENTS_X lelx
+#define NUMBER_ELEMENTS_Y lely
+#define NUMBER_ELEMENTS_Z lelz
+
+c - flags    -----------------------------------------------------------
+#define IF_BED uparam(16).gt.0.0          /*Whether bedform calculations are done (uparam(6) greater than 0) */
+#define IF_SHCR_VAR .TRUE.                /*Whether the critical Shields number depends on the bed angle */
+#define IF_ALL_BED .TRUE.                 /*Whether all the bedform stats are saved or only the heights */
+#define IF_MVMESH .FALSE.                  /*Whether the mesh at the bottom will be deformed by the bedform.*/
+#define IF_DIVQ .TRUE.                    /*Whether to include sediment flux (-div q) in Exner equation.*/    
+#define IF_EROS .TRUE.                    /*Whether to include sediment entrainment (-E_s) in Exner equation.*/    
+#define IF_DEPO .TRUE.                    /*Whether to include sediment deposition (C_b) in Exner equation.*/    
+#define IF_HIS .FALSE.                     /*Whether to save history points*/
+
+
+      subroutine uservp (ix,iy,iz,eg)
+      include 'SIZE'
+      include 'TOTAL'
+      include 'NEKUSE'
+
+      return
+      end
+c-----------------------------------------------------------------------
+      subroutine userf  (ix,iy,iz,eg)
+      include 'SIZE'
+      include 'TOTAL'
+      include 'NEKUSE'
+      include 'ZPER'  ! for nelx,nely,nelz
+
+
+c      real*8 egrav(3)
+C     HYDROSTATIC PRESSURE VARIABLES
+c      common /TBAR/ tempbar_2(ly1,lely)
+c      integer ex,ey,ez
+
+
+c     MESH VARIABLES 
+c      egrav(1) = 0.0                         !x: Spanwise direction
+c      egrav(2) = -1.0*RITAU
+c      egrav(3) = 1.0                         !z: Streamwise direction
+
+c     Note: this is an acceleration term, NOT a force!
+c     Thus, ffx will subsequently be multiplied by rho(x,t).
+c      call get_exyz(ex,ey,ez,eg,nelx,nely,nelz)
+c      ffx = temp*egrav(1)
+c      ffy = (temp - tempbar_2(iy,ey))*egrav(2)
+c      ffz = temp*egrav(3)
+      ffx = 0.0
+      ffy = 0.0
+      ffz = 1.0
+c     ############################################################
+c     ############################################################
+
+      return
+      end
+c-----------------------------------------------------------------------
+      subroutine userq  (ix,iy,iz,eg)
+      include 'SIZE'
+      include 'TOTAL'
+      include 'NEKUSE'
+
+      common /VS_GRADT/ vsgradt(lx1,ly1,lz1,lelt)
+      integer e,f,eg
+
+      e = gllel(eg)
+
+      if (V_SETTLING.ne.0) then
+          qvol   = -1.0*vsgradt(ix,iy,iz,e)
+      else
+          qvol=0.0
+      endif
+      source = 0.0
+
+      return
+      end
+
+c-----------------------------------------------------------------------
+
+      subroutine userchk
+      include 'SIZE'
+      include 'TOTAL'
+      include 'ZPER'  ! for nelx,nely,nelz
+
+c     ############################################################
+c     INTERPOLATE EXTERNAL INFLOW FILE AND SETS INFLOW PLANE
+      real dtimestep
+
+      integer if_mean_2d
+      save if_mean_2d
+
+      integer counter_inflow
+      save counter_inflow
+
+      real theta
+
+c     spanwise-averaged arrays
+      real    yavgx(ny1,nz1,lely,lelz)
+     $    ,   zavgx(ny1,nz1,lely,lelz)
+
+      common /avgstats/
+     &  rumm(lx1,ly1,lz1,lelt,4)
+     & , ru2m(lx1,ly1,lz1,lelt,4)
+     & , ruvm(lx1,ly1,lz1,lelt,6)
+     & , ruxm(lx1,ly1,lz1,lelt,12)
+     & , rux2(lx1,ly1,lz1,lelt,12)
+     & , ru3m(lx1,ly1,lz1,lelt,4)
+     & , rv2u(lx1,ly1,lz1,lelt,6)
+     & , rpmm(lx1,ly1,lz1,lelt,4)
+     & , summ(lx1,ly1,lz1,lelt,4)
+     & , su2m(lx1,ly1,lz1,lelt,4)
+     & , suvm(lx1,ly1,lz1,lelt,6)
+     & , suxm(lx1,ly1,lz1,lelt,12)
+     & , sux2(lx1,ly1,lz1,lelt,12)
+     & , su3m(lx1,ly1,lz1,lelt,4)
+     & , sv2u(lx1,ly1,lz1,lelt,6)
+     & , spmm(lx1,ly1,lz1,lelt,4)
+     & , summ_2d(ly1,lz1,lely,lelz,4)
+     & , su2m_2d(ly1,lz1,lely,lelz,4)
+     & , suvm_2d(ly1,lz1,lely,lelz,6)
+     & , suxm_2d(ly1,lz1,lely,lelz,12)
+     & , sux2_2d(ly1,lz1,lely,lelz,12)
+     & , su3m_2d(ly1,lz1,lely,lelz,4)
+     & , sv2u_2d(ly1,lz1,lely,lelz,6)
+     & , spmm_2d(ly1,lz1,lely,lelz,4)
+
+
+      common /avgstats_old/
+     &  summ_2d_o(ly1,lz1,lely,lelz,4)
+     & , su2m_2d_o(ly1,lz1,lely,lelz,4)
+     & , suvm_2d_o(ly1,lz1,lely,lelz,6)
+     & , suxm_2d_o(ly1,lz1,lely,lelz,12)
+     & , sux2_2d_o(ly1,lz1,lely,lelz,12)
+     & , su3m_2d_o(lx1,ly1,lz1,lelt,4)
+     & , sv2u_2d_o(lx1,ly1,lz1,lelt,6)
+     & , spmm_2d_o(lx1,ly1,lz1,lelt,4)
+     & , timem,atimem,timelm,dtimem,t_tot
+
+      integer counter1
+
+      integer if_write_means
+      integer counter_mean
+      save counter_mean
+      data    counter_mean /0/
+
+      logical ifverbose
+      real wo1(lx1,ly1,lz1,lelv)
+     &      ,  wo2(lx1,ly1,lz1,lelv)
+     &      ,  wo3(lx1,ly1,lz1,lelv)
+     &      ,  wo4(lx1,ly1,lz1,lelv)
+     &      ,  wo5(lx1,ly1,lz1,lelv)
+     &      ,  wo6(lx1,ly1,lz1,lelv)
+
+
+      real             w1(ly1,lz1,lely,lelz)
+     &              ,  w2(ly1,lz1,lely,lelz)
+     &              ,  w3(ly1,lz1,lely,lelz)
+     &              ,  w4(ly1,lz1,lely,lelz)
+     &              ,  wy1(ly1,nely)
+     &              ,  wy2(ly1,nely)
+      save igs_x, igs_z, igs_y
+
+      integer e,ex,ey,ez,eg
+
+c     2d spanwise-averaged arrays 
+      real v2d(ly1,lz1,lely,lelz),w2d(ly1,lz1,lely,lelz),
+     &     y2d(ly1,lz1,lely,lelz),z2d(ly1,lz1,lely,lelz),
+     &     tt2d(ly1,lz1,lely,lelz)
+
+
+c     average in time variables
+      integer icalled
+      save    icalled
+      data    icalled /0/
+
+      real atime,timel
+      save atime,timel
+      real alpha,beta
+      integer n,nt
+
+      integer icnt_time
+      save    icnt_time
+      data    icnt_time /0/
+
+      integer icnt
+      save    icnt
+      data    icnt /0/
+c
+      character*32 istepc,outfile
+
+      character*80 icfile
+c
+c     Gradient arrays for shear velocity, 
+c     tke production and dissipation computation
+      real vxx(lx1,ly1,lz1,lelv),
+     $     vxy(lx1,ly1,lz1,lelv),
+     $     vxz(lx1,ly1,lz1,lelv),
+     $     vyx(lx1,ly1,lz1,lelv),
+     $     vyy(lx1,ly1,lz1,lelv),
+     $     vyz(lx1,ly1,lz1,lelv),
+     $     vzx(lx1,ly1,lz1,lelv),
+     $     vzy(lx1,ly1,lz1,lelv),
+     $     vzz(lx1,ly1,lz1,lelv),
+     $     tx(lx1,ly1,lz1,lelv),
+     $     ty(lx1,ly1,lz1,lelv),
+     $     tz(lx1,ly1,lz1,lelv)
+
+c     ############################################################
+c     HYDROSTATIC PRESSURE VARIABLES
+      common /TBAR/ tempbar(ly1,lz1,lely,lelz),tempbar_2(ly1,lely)
+      real w1t(ly1,lely),w2t(ly1,lely)
+      
+      common /VS_GRADT/ vsgradt(lx1,ly1,lz1,lelt)
+      common /VS_VEC/ vs(3)
+      
+      parameter (llt=lx1*ly1*lz1*lelt)
+      common /cmygeom/ xmo(llt),ymo(llt),zmo(llt)
+
+      common /v_filter/ vx_f(lx1,ly1,lz1,lelv),vy_f(lx1,ly1,lz1,lelv),
+     &                  vz_f(lx1,ly1,lz1,lelv),t_f(lx1,ly1,lz1,lelv)
+
+c      Exner variables
+      real wxz1(lx1,lz1,lelx,lelz),wxz2(lx1,lz1,lelx,lelz), !working arrays
+     &     wxz3(lx1,lz1,lelx,lelz),
+     &     btt(lx1,lz1,lelx,lelz),  !bottom concentration
+     &     btuy(lx1,lz1,lelx,lelz),  !bottom dvx/dy
+     &     btwy(lx1,lz1,lelx,lelz),  !bottom dvz/dy
+     &     btvy(lx1,lz1,lelx,lelz),  !bottom dvy/dy
+     &     sh_x(lx1,lz1,lelx,lelz),  !Shields number
+     &     sh_z(lx1,lz1,lelx,lelz),  !Shields number
+     &     sh_cr(lx1,lz1,lelx,lelz),  !Critical Shields number
+     &     qbx(lx1,lz1,lelx,lelz),   !Bottom sediment flux
+     &     qbz(lx1,lz1,lelx,lelz),  !Bottom sediment flux
+     &     int_t(lx1,lz1,lelx,lelz),
+     &     qbxx(lx1,lz1,lelx,lelz),
+     &     qbzz(lx1,lz1,lelx,lelz),
+     &     theta_bedx(lx1,lz1,lelx,lelz),
+     &     theta_bedz(lx1,lz1,lelx,lelz),
+     &     B_eta(lx1,lz1,lelx,lelz),
+     &     lap_eta(lx1,lz1,lelx,lelz),
+     &     bed_normal(lx1,lz1,lelx,lelz,3),
+     &     bed_wk(lx1,lz1,lelx,lelz,3),
+     &     sn(3)
+
+
+      real normdum
+      integer nxz
+
+      common /erosion/ E_s(lx1,lz1,lelx,lelz) 
+
+      common /heights/ eta(lx1,lz1,lelx,lelz),
+     &               eta_e(lx1,lz1,lelx,lelz),
+     &               eta_d(lx1,lz1,lelx,lelz),
+     &               eta_q(lx1,lz1,lelx,lelz)
+
+      common /eta_mvbc/ umeshx(lx1,ly1,lz1,lelv)
+     &              , umeshy(lx1,ly1,lz1,lelv)
+     &              , umeshz(lx1,ly1,lz1,lelv)
+     &              , rhs(lx1,lz1,lelx,lelz)
+      real dtprev
+      save dtprev
+
+      real zbmm(lx1,lz1,lelx,lelz), xbmm(lx1,lz1,lelx,lelz) !mesh at the bottom
+      save xbmm, zbmm
+
+c     ############################################################
+      nelx  = NUMBER_ELEMENTS_X
+      nely  = NUMBER_ELEMENTS_Y
+      nelz  = NUMBER_ELEMENTS_Z
+      n=nx1*ny1*nz1*nelv  
+      nt=nx1*ny1*nz1*nelt
+      m=ny1*nz1*nely*nelz
+      nxz=nx1*nz1*nelx*nelz
+
+c     ############################################################
+c      if(nid.eq.0 .and. istep.eq.0) then
+c        write(*,*)'*************SIMULATION PARAMETERS******************'
+c        write(*,*)'+Mesh parameters:'
+c        write(*,*)'xlen = ',xlen_inflow*(2.0*nelsides/(1.0*nelxin)+1)
+c     &           ,'ylen = ',YLEN,'zlen = ',ZLEN
+c        write(*,*)'lelx = ',lelx,'lely = ',lely,'lelz = ',lelz,
+c     &            'N = ',lx1-1
+c        write(*,*)'+Boundary Conditions:'
+c        if (BC_FLAG_TEMP.eq.0) then
+c          write(*,*)'Bottom BC : dc/dn = 0'
+c        elseif (BC_FLAG_TEMP.eq.1) then
+c          write(*,*)'Bottom BC : (1/Pe) dc/dn = -|V_s.C_b|'
+c        else
+c          write(*,*)'Bottom BC : (1/Pe) dc/dn = -|V_s.E_s|'
+c        endif
+c        if (UTARGET.gt.0.0) then
+c          write(*,*)'Top BC : Perfectly Matched Layer with u_target = ',
+c     &    UTARGET
+c        elseif (UTARGET.lt.0.0) then
+c          write(*,*)'Top BC : Fixed inflow velocity u_top = ',
+c     &   -1.0*UTARGET   
+c        else
+c          write(*,*)'Top BC : Inflow velocity equal to mean',
+c     &     ' entrainment velocity.'
+c        endif
+c        write(*,*)'+Input parameters:'
+c        write(*,*)'Re_tau = ',RE_TAU
+c        write(*,*)'Ri_tau 1 = ',RITAU
+c        write(*,*)'Ri_tau 2 = ',RITAU2
+c        write(*,*)'d = ',DIAM
+c        write(*,*)'V_settling = ',V_SETTLING
+c        write(*,*)'Schmidt = ',param(8)/param(2)
+c        write(*,*)'Packing fraction = ',PACKING_FR
+c        write(*,*)'Duration of inflow flow = ', time_inflow 
+c        write(*,*)'+Derived parameters:'         
+c        write(*,*)'theta 1 (degrees)= ',180*atan(1/RITAU)/PI
+c        write(*,*)'c^v = ',Cv
+c        write(*,*)'Re_p = ',RE_P
+c      endif
+c
+c     ############################################################
+c     Settling velocity of sediment (absolute value)
+c     COMPUTE VS*GRAD(TEMP) (STORED IN VSGRADT)
+c
+c     Settling velocity
+      vs(1) = 0.0
+      vs(2) = (-1.0)*V_SETTLING
+      vs(3) = 0.0
+
+c     Compute grad(t)
+      call gradm1(tx,ty,tz,t(1,1,1,1,1))
+
+      if (V_SETTLING.ne.0) then
+c     Compute vs*grad(t)
+      do e=1,nelt
+        do i=1,lx1*ly1*lz1
+          vsgradt(i,1,1,e) =  vs(1) * tx(i,1,1,e) +
+     $                        vs(2) * ty(i,1,1,e) +
+     $                        vs(3) * tz(i,1,1,e)
+        enddo
+      enddo
+      endif
+
+c     ############################################################
+c     ############################################################
+c     OUTPUT INITIAL CONDITION
+      if (istep.eq.0) then
+        ifxyo = .true.
+        call prepost(.true.,'   ' )
+        if (.not. IF_MVMESH) ifxyo = .false.
+        call print_yz_mesh
+        call print_xz_mesh
+      endif 
+
+
+c     ############################################################
+      if (istep.eq.0) then 
+        call x_slice(ymm,ym1,w1,w2)
+        call y_slice(zbmm,zm1,wxz1)
+        call y_slice(xbmm,xm1,wxz1)
+        call rzero(eta,size(eta))
+        call rzero(eta_q,size(eta_q))
+        call rzero(eta_e,size(eta_e))
+        call rzero(eta_d,size(eta_d))
+      endif
+      if(icalled.eq.0) then
+        call rzero(rumm,size(rumm))
+        call rzero(ru2m,size(ru2m))
+        call rzero(ruvm,size(ruvm))
+        call rzero(ruxm,size(ruxm))
+        call rzero(rux2,size(rux2))
+        call rzero(ru3m,size(rux2))
+        call rzero(rv2u,size(rux2))
+        call rzero(rpmm,size(rux2))
+        call gtpp_gs_setup(igs_x,nelx,nely,  nelz,1) ! x-avx
+        call gtpp_gs_setup(igs_z,nelx*nely,1,nelz,3) ! z-avx
+        call gtpp_gs_setup(igs_y,nelx,nely,  nelz,2) ! y-avx
+        atime = 0.
+        timel = time
+        icalled = 1
+      endif !(icalled.eq.0)
+
+c     ############################################################
+
+c     write 2d spanwise-averaged files 
+      if(mod(istep,int(iostep_2d_notime)).eq.0) then
+          call planar_avg(wo1,vz,igs_x) 
+          call x_slice2(wo1,w1)
+          if (nid.eq.0) call x_slice3(w2d)
+
+          call planar_avg(wo1,vy,igs_x) 
+          call x_slice2(wo1,w1)
+          if (nid.eq.0) call x_slice3(v2d)
+
+          call planar_avg(wo1,t(1,1,1,1,1),igs_x) 
+          call x_slice2(wo1,w1)
+          if (nid.eq.0) call x_slice3(tt2d)
+          call nekgsync()
+
+          call output_2d(time,w2d,v2d,tt2d)
+      endif
+
+
+c     ############################################################
+c     COMPUTE HYDROSTATIC PRESSURE (AVERAGE OF TEMP(y))
+c     FOR REFERENCE ON THIS TERM SEE CANTERO 2009 JGR
+      call planar_avg(wo1,t(1,1,1,1,1),igs_x)
+      call planar_avg(wo2,wo1,igs_z)
+      call y_line(tempbar_2,wo2,w1t,w2t)
+
+      if(IF_HIS) call hpts()
+
+c     ############################################################
+c     Exner equation calculations
+c     All this could and should be done only by nid.eq.0, I should fix that eventually, but I highly doubt that this is a performance issue.
+c     --------------------------
+      if (IF_BED) then
+C         call copy(t_f,t(1,1,1,1,1),n)
+C         call gradm1(wo1,wo2,wo3,vx_f)
+C         call gradm1(wo4,wo5,wo6,vz_f)
+        if (restart_bed.ne.0) call read_bed(eta) !rewrite!!!!!!!!!!!!!
+C          if (istep.eq.0) then
+C C            call y_slice(eta,ym1,wxz1)
+C          endif
+
+        if (IF_MVMESH) then
+          call bed_angle(eta,theta_bedx,theta_bedz,lap_eta,
+     &               wo1,wo2,wo3,wo4,wxz1,wxz2,xbmm,zbmm) !computes bed angle and lap(eta)
+
+          call copy(vx_f,vx,n)
+          call copy(vy_f,vy,n)
+          call copy(vz_f,vz,n)
+          call stress_normal(btuy,btwy,wxz1,
+     &                        theta_bedx,theta_bedz)
+
+        else
+          call gradm1(vxx,vxy,vxz,vx)
+          call gradm1(vzx,vzy,vzz,vz)
+
+          call y_slice(btuy,vxy,wxz1)  !btuy -> dux/dy at y=0
+          call y_slice(btwy,vzy,wxz1)  !btwy -> duz/dy at y=0
+
+        endif !if_mvmsh
+
+        call bed_filter(btuy, zbmm, xbmm,0)
+        call bed_filter(btwy, zbmm, xbmm,0)
+
+        call parker_erosion(btuy,btwy)  !Compute Parker erosion model. In a common block because of userbc
+        call y_slice(btt,t(1,1,1,1,1),wxz1)      !bottom concentration
+
+        call temp_threshold(t(1,1,1,1,1),wo1)
+        call col2(wo1,t(1,1,1,1,1),n)
+        call planar_avg(wo2,wo1,igs_y)
+        call y_slice(int_t,wo2,wxz1)  !integral of concentration in wall-normal direction
+        call bedform_calcs(btwy,btuy,btt,xbmm,zbmm,wo1,wo2,wo3,wo4,
+     &                  igs_x,igs_y,igs_z,
+     &                     wxz1,wxz2,wxz3,sh_x,sh_z,sh_cr,qbx,qbz,int_t,
+     &               qbxx,qbzz,theta_bedx,theta_bedz,B_eta, lap_eta)
+
+         if (IF_MVMESH)  then
+           call eta_mvmesh()
+c           if (mod(istep,int(MV_STEP)).eq.0) then
+c            if_mvmine = .true.   !check line 280 of drive1.f, I added this flag
+c            if (nid.eq.0) write(*,*) 'Updating eigenvalues...........'
+c           else
+c            if_mvmine =.false.
+c           endif
+         endif   
+      endif !if_bed
+
+c     ##################################################################
+c      Time and spanwise averaging
+c     ##################################################################
+        if (time.lt.mean_time_start 
+     &     .and.restart_means.gt.0)  return
+
+      dtime = time - timel - mean_time_start
+      atime = atime + dtime
+
+      if (param(15).ne.0) then !write control -> numsteps
+        if (mod(istep,int(iostep_2d_avg_time)).eq.0) then 
+          if_write_means = 1
+        else
+          if_write_means = 0
+        endif
+      else  !write control -> time
+       if (iostep_2d_avg_time*aint((time-mean_time_start)/
+     &  iostep_2d_avg_time).ge.
+     &  counter_mean*iostep_2d_avg_time)  then 
+          if_write_means = 1
+          counter_mean = counter_mean +1 
+        else
+          if_write_means = 0
+       endif
+      endif
+
+c     compute gradients
+      call gradm1(vxx,vxy,vxz,vx)
+      call gradm1(vyx,vyy,vyz,vy)
+      call gradm1(vzx,vzy,vzz,vz)
+
+c     call gradm1(tx,ty,tz,t(1,1,1,1,1)) !this is already computed in the settling velocity part
+
+c     averaging over time
+      if (atime.ne.0 .and. dtime.ne.0 .and. istep.ne.0 ) then
+        beta      = dtime / atime
+        if (uparam(14).lt.0) beta = 1.0   !means will not be accumulated on time. Not the most elegant solution, I know.
+        alpha     = 1. - beta
+
+        ifverbose = .false.
+c       Compute time-average of u,v,w and t       
+        call avg1(rumm(1,1,1,1,1),vx,alpha,beta,n,'uavg',ifverbose)
+        call avg1(rumm(1,1,1,1,2),vy,alpha,beta,n,'vavg',ifverbose) 
+        call avg1(rumm(1,1,1,1,3),vz,alpha,beta,n,'wavg',ifverbose) 
+        call avg1(rumm(1,1,1,1,4),t, alpha,beta,n,'tavg',ifverbose)
+c       Compute time-average of u^2,v^2,w^2 and t^2     
+        call avg2(ru2m(1,1,1,1,1),vx,alpha,beta,n,'u2mm',ifverbose)
+        call avg2(ru2m(1,1,1,1,2),vy,alpha,beta,n,'v2mm',ifverbose) 
+        call avg2(ru2m(1,1,1,1,3),vz,alpha,beta,n,'w2mm',ifverbose) 
+        call avg2(ru2m(1,1,1,1,4),t ,alpha,beta,n,'t2mm',ifverbose)
+
+c       Compute time-average of cross products
+        call avg3(ruvm(1,1,1,1,1),vx,vy,alpha,beta,n,'uvmm',ifverbose)
+        call avg3(ruvm(1,1,1,1,2),vx,vz,alpha,beta,n,'uwmm',ifverbose)
+        call avg3(ruvm(1,1,1,1,3),vx, t,alpha,beta,n,'utmm',ifverbose)
+        call avg3(ruvm(1,1,1,1,4),vy,vz,alpha,beta,n,'vwmm',ifverbose)
+        call avg3(ruvm(1,1,1,1,5),vy, t,alpha,beta,n,'vtmm',ifverbose)
+        call avg3(ruvm(1,1,1,1,6),vz, t,alpha,beta,n,'wtmm',ifverbose)
+c       Compute time-average of gradients     
+        call avg1(ruxm(1,1,1,1,1),vxx,alpha,beta,n,'uxmm',ifverbose)
+        call avg1(ruxm(1,1,1,1,2),vxy,alpha,beta,n,'uymm',ifverbose)
+        call avg1(ruxm(1,1,1,1,3),vxz,alpha,beta,n,'uzmm',ifverbose)
+
+        call avg1(ruxm(1,1,1,1,4),vyx,alpha,beta,n,'vxmm',ifverbose)
+        call avg1(ruxm(1,1,1,1,5),vyy,alpha,beta,n,'vymm',ifverbose)
+        call avg1(ruxm(1,1,1,1,6),vyz,alpha,beta,n,'vzmm',ifverbose)
+
+        call avg1(ruxm(1,1,1,1,7),vzx,alpha,beta,n,'wxmm',ifverbose)
+        call avg1(ruxm(1,1,1,1,8),vzy,alpha,beta,n,'wymm',ifverbose)
+        call avg1(ruxm(1,1,1,1,9),vzz,alpha,beta,n,'wzmm',ifverbose)
+
+        call avg1(ruxm(1,1,1,1,10),tx ,alpha,beta,n,'txmm',ifverbose)
+        call avg1(ruxm(1,1,1,1,11),ty ,alpha,beta,n,'tymm',ifverbose)
+        call avg1(ruxm(1,1,1,1,12),tz ,alpha,beta,n,'tzmm',ifverbose)
+c       Compute time-average of squared gradients
+        call avg2(rux2(1,1,1,1,1),vxx,alpha,beta,n,'ux2m',ifverbose)
+        call avg2(rux2(1,1,1,1,2),vxy,alpha,beta,n,'uy2m',ifverbose)
+        call avg2(rux2(1,1,1,1,3),vxz,alpha,beta,n,'uz2m',ifverbose)
+
+        call avg2(rux2(1,1,1,1,4),vyx,alpha,beta,n,'vx2m',ifverbose)
+        call avg2(rux2(1,1,1,1,5),vyy,alpha,beta,n,'vy2m',ifverbose)
+        call avg2(rux2(1,1,1,1,6),vyz,alpha,beta,n,'vz2m',ifverbose)
+
+        call avg2(rux2(1,1,1,1,7),vzx,alpha,beta,n,'wx2m',ifverbose)
+        call avg2(rux2(1,1,1,1,8),vzy,alpha,beta,n,'wy2m',ifverbose)
+        call avg2(rux2(1,1,1,1,9),vzz,alpha,beta,n,'wz2m',ifverbose)
+
+        call avg2(rux2(1,1,1,1,10),tx ,alpha,beta,n,'tx2m',ifverbose)
+        call avg2(rux2(1,1,1,1,11),ty ,alpha,beta,n,'ty2m',ifverbose)
+        call avg2(rux2(1,1,1,1,12),tz ,alpha,beta,n,'tz2m',ifverbose)
+c        Compute time average of u^3, v^3, w^3, t^3
+        call avg3(ru3m(1,1,1,1,1),ru2m(1,1,1,1,1),vx, alpha,beta,n,
+     &                                            'u3mm',ifverbose)
+        call avg3(ru3m(1,1,1,1,2),ru2m(1,1,1,1,2),vy, alpha,beta,n,
+     &                                            'v3mm',ifverbose)
+        call avg3(ru3m(1,1,1,1,3),ru2m(1,1,1,1,3),vz, alpha,beta,n,
+     &                                            'w3mm',ifverbose)
+        call avg3(ru3m(1,1,1,1,4),ru2m(1,1,1,1,4),t, alpha,beta,n,
+     &                                            't3mm',ifverbose)
+c        Compute uv^2,uw^2, etc
+        call avg3(rv2u(1,1,1,1,1),ru2m(1,1,1,1,1),vy, alpha,beta,n,
+     &                                            'vu2m',ifverbose)
+        call avg3(rv2u(1,1,1,1,2),ru2m(1,1,1,1,1),vz, alpha,beta,n,
+     &                                            'wu2m',ifverbose)
+        call avg3(rv2u(1,1,1,1,3),ru2m(1,1,1,1,2),vx, alpha,beta,n,
+     &                                            'uv2m',ifverbose)
+        call avg3(rv2u(1,1,1,1,4),ru2m(1,1,1,1,2),vz, alpha,beta,n,
+     &                                            'wv2m',ifverbose)
+        call avg3(rv2u(1,1,1,1,5),ru2m(1,1,1,1,3),vx, alpha,beta,n,
+     &                                            'uw2m',ifverbose)
+        call avg3(rv2u(1,1,1,1,6),ru2m(1,1,1,1,3),vy, alpha,beta,n,
+     &                                            'vw2m',ifverbose)
+c        Compute p, up, vp, wp
+        call avg1(rpmm(1,1,1,1,1),pr,alpha,beta,n,'pavg',ifverbose)
+        call avg3(rpmm(1,1,1,1,2),pr,vx, alpha,beta,n,'upmm',ifverbose)
+        call avg3(rpmm(1,1,1,1,3),pr,vy, alpha,beta,n,'vpmm',ifverbose)
+        call avg3(rpmm(1,1,1,1,4),pr,vz, alpha,beta,n,'wpmm',ifverbose)
+      endif ! (atime.ne.0 .and. dtime.ne.0 .and. istep.ne.0 )
+      timel = time  - mean_time_start
+
+c     ############################################################
+C       if (istep.ne.0 .and. 
+C      &    mod(istep,int(iostep_2d_avg_time)).eq.0) then
+      if (istep.ne.0 .and. if_write_means.eq.1) then
+c     spanwise averaging
+        do i =1,12
+          call planar_avg(suxm(1,1,1,1,i),ruxm(1,1,1,1,i),igs_x) !x averaging
+          call x_slice2(suxm(1,1,1,1,i),w1)     !x_slice2 and 3 take an slice on the yz plane. They are both needed to avoid unnnecessary memory declarations on all procceses
+          if (nid.eq.0) call x_slice3(suxm_2d(1,1,1,1,i))
+          call planar_avg(sux2(1,1,1,1,i),rux2(1,1,1,1,i),igs_x) !x averaging
+          call x_slice2(sux2(1,1,1,1,i),w1)
+          if (nid.eq.0) call x_slice3(sux2_2d(1,1,1,1,i))
+        enddo
+        do i =1,6
+          call planar_avg(suvm(1,1,1,1,i),ruvm(1,1,1,1,i),igs_x) !x averaging
+          call x_slice2(suvm(1,1,1,1,i),w1)
+          if (nid.eq.0)  call x_slice3(suvm_2d(1,1,1,1,i))
+          call planar_avg(sv2u(1,1,1,1,i),rv2u(1,1,1,1,i),igs_x) !x averaging
+          call x_slice2(sv2u(1,1,1,1,i),w1)
+          if (nid.eq.0)   call x_slice3(sv2u_2d(1,1,1,1,i))
+        enddo
+        do i =1,4
+          call planar_avg(summ(1,1,1,1,i),rumm(1,1,1,1,i),igs_x) !x averaging
+          call x_slice2(summ(1,1,1,1,i),w1)
+          if (nid.eq.0)call x_slice3(summ_2d(1,1,1,1,i))
+          call planar_avg(su2m(1,1,1,1,i),ru2m(1,1,1,1,i),igs_x) !x averaging
+          call x_slice2(su2m(1,1,1,1,i),w1)
+          if (nid.eq.0)call x_slice3(su2m_2d(1,1,1,1,i))
+          call planar_avg(su3m(1,1,1,1,i),ru3m(1,1,1,1,i),igs_x) !x averaging
+          call x_slice2(su3m(1,1,1,1,i),w1)
+          if (nid.eq.0)call x_slice3(su3m_2d(1,1,1,1,i))
+          call planar_avg(spmm(1,1,1,1,i),rpmm(1,1,1,1,i),igs_x) !x averaging
+          call x_slice2(spmm(1,1,1,1,i),w1)
+          if (nid.eq.0)call x_slice3(spmm_2d(1,1,1,1,i))
+        enddo
+        call nekgsync()
+         if (restart_means.gt.0) then
+          if (param(15).ne.0) then !write control -> numsteps
+            call output_means(atime,timel,dtime,w4,istep)
+          else
+            call output_means(atime,timel,dtime,w4,counter_mean)
+          endif
+         endif
+      endif !(istep.gt.0 .and. mod(istep,int(iostep_2d_avg_time)).eq.0)
+
+c     ############################################################
+c     load restart statistics and average them with the new ones 
+C       if(restart_means.lt.0 .and.nid.eq.0 .and.
+C      &  mod(istep,int(iostep_2d_avg_time)).eq.0 .and. istep.ne.0) then
+      if(restart_means.lt.0 .and.nid.eq.0 .and.
+     &  if_write_means.eq.1 .and. istep.ne.0) then
+        if (istep.eq.int(iostep_2d_avg_time)) then !this variables remain in a common block, it's not necessary to load them everytime
+          call input_means()
+        endif
+        t_tot=atime+atimem
+        alpha=atime/t_tot
+        beta=1-alpha
+        ifverbose= .false.
+        do i=1,4
+          call avg1(summ_2d(1,1,1,1,i),summ_2d_o(1,1,1,1,i),alpha,beta,
+     &        m,'uavg',ifverbose)
+        enddo
+        do i=1,4
+          call avg1(su2m_2d(1,1,1,1,i),su2m_2d_o(1,1,1,1,i),alpha,beta,
+     &        m,'u2mm',ifverbose)
+        enddo
+        do i=1,6
+           call avg1(suvm_2d(1,1,1,1,i),suvm_2d_o(1,1,1,1,i),alpha,beta,
+     &        m,'uvmm',ifverbose)
+        enddo
+        do i=1,12
+           call avg1(suxm_2d(1,1,1,1,i),suxm_2d_o(1,1,1,1,i),alpha,beta,
+     &        m,'uxmm',ifverbose)
+        enddo
+        do i=1,12
+           call avg1(sux2_2d(1,1,1,1,i),sux2_2d_o(1,1,1,1,i),alpha,beta,
+     &        m,'ux2m',ifverbose)
+        enddo
+        do i=1,4
+           call avg1(su3m_2d(1,1,1,1,i),su3m_2d_o(1,1,1,1,i),alpha,beta,
+     &        m,'u3mm',ifverbose)
+        enddo
+        do i=1,6
+           call avg1(sv2u_2d(1,1,1,1,i),sv2u_2d_o(1,1,1,1,i),alpha,beta,
+     &        m,'v2um',ifverbose)
+        enddo
+        do i=1,4
+           call avg1(spmm_2d(1,1,1,1,i),spmm_2d_o(1,1,1,1,i),alpha,beta,
+     &        m,'pavg',ifverbose)
+        enddo
+        if (param(15).ne.0) then !write control -> numsteps
+            call output_means(atime,timel,dtime,w4,istep)
+        else
+            call output_means(atime,timel,dtime,w4,counter_mean)
+        endif
+      endif !(restart_means.lt.0 .and. istep.eq.iostep_2d_avg_time)
+      return
+      end
+
+c-----------------------------------------------------------------------
+      subroutine userbc (ix,iy,iz,iside,ieg)
+
+      include 'SIZE'
+      include 'TOTAL'
+      include 'NEKUSE'
+      include 'NEKNEK'
+
+      integer e,ex,ey,ez
+
+c     VS*GRAD(TEMP) BC VARIABLES
+      real sn(3)
+      common /VS_VEC/ vs(3)
+
+      common /erosion/ E_s(lx1,lz1,lelx,lelz)
+
+      common /eta_mvbc/ umeshx(lx1,ly1,lz1,lelv)
+     &              , umeshy(lx1,ly1,lz1,lelv)
+     &              , umeshz(lx1,ly1,lz1,lelv)
+     &              , rhs(lx1,lz1,lelx,lelz)
+
+      e = gllel(ieg)
+
+      call get_exyz(ex,ey,ez,ieg,lelx,lely,lelz)
+
+      ux   = 0.
+      uy   = 0.
+      uz   = 0.
+      temp = 0.
+
+c     ############################################################
+c     BOTTOM TEMP BC 
+      if (V_SETTLING.ne.0 .and. BC_FLAG_TEMP.eq.1) then
+        call getSnormal(sn,ix,iy,iz,iside,e)
+c     Compute hc for Newton cooling BC, bypass mode BC
+c     (1/Pe)*grad(T) dot n = (Vs*T) dot n
+        hc = (-1)*(vs(1)*sn(1) + vs(2)*sn(2) + vs(3)*sn(3))
+      endif
+      if (V_SETTLING.ne.0 .and. BC_FLAG_TEMP.eq.2) then
+        call getSnormal(sn,ix,iy,iz,iside,e)
+c     Compute flux for flux BC, Erosion mode BC
+c     (1/Pe)*grad(T) dot n = -|Vs*E_s| dot n
+        flux=0.0
+c      if (z .lt. ZLEN-2*(ZLEN-ZBUFF) ) then  !things get messy near the increased viscosity outlet
+c        flux = (-1.0)*abs(E_s(ix,iz,ex,ez)*sn(1) +E_s(ix,iz,ex,ez)*sn(2)
+c     &   + E_s(ix,iz,ex,ez)*sn(3))
+c      endif
+      endif
+
+c     #########################################################
+c     MOVING MESH
+c     Bottom velocity BC
+      if (cbc(iside,e,1).eq.'mv ') then
+          ux = umeshx(ix,iy,iz,e)
+          uy = umeshy(ix,iy,iz,e)
+          uz = umeshz(ix,iy,iz,e)
+      endif
+
+      return
+      end
+
+      end
+c-----------------------------------------------------------------------
+      subroutine useric (ix,iy,iz,ieg)
+      include 'SIZE'
+      include 'TOTAL'
+      include 'NEKUSE'
+      ux = 0.0
+      uy = 0.0
+      uz = 0.0
+      temp = 0.0
+
+cc     ############################################################
+cc     ############################################################
+c
+c      uz  = 18.0-18.0*(1.-y**4.0) +
+c     $   8.*cos(12.0*x)*exp(0.5-32.4*(1-(-1)*y)**2.0)*(1-(-1)*y)
+c
+c      uy  = 0.0
+c      ux  = 18.*21.6*sin(12.0*x)
+c     $   *exp(-32.4*(1-(1)*abs(y-1))**2.0)*(1-(1)*abs(y-1))
+cc
+cc     ############################################################
+cc     ############################################################
+
+      return
+      end
+c-----------------------------------------------------------------------
+      subroutine usrdat
+      include 'SIZE'
+      include 'TOTAL'
+      real one, rpi
+
+      param(59) = 1. ! Force nek5 to recognize element deformation.
+
+      n=8*nelt
+      do i=1,n
+        y=yc(i,1)
+        yc(i,1) = (1.0 - sinh(3.25*(1.0-(-1)*y))/sinh(3.25))
+     $           /(1.0 - sinh(3.25*(1.0-(-1)*1))/sinh(3.25))
+        xc(i,1) =  XLEN * xc(i,1)
+        zc(i,1) =  ZLEN * zc(i,1)
+      enddo
+      
+      return
+      end
+
+c-----------------------------------------------------------------------
+      subroutine usrdat2
+      include 'SIZE'
+      include 'TOTAL'
+
+      param(59) = 1 
+
+
+      if (V_SETTLING.ne.0 .and. BC_FLAG_TEMP.eq.1) then !change bottom temp BC from I to c
+          ifc=1 !bottom face, if it was generated by genbox
+          do iel=1,nelt
+             if (cbc(ifc,iel,2) .eq. 'I  ') cbc(ifc,iel,2) = 'c  '
+          enddo
+      endif
+      if (V_SETTLING.ne.0 .and. BC_FLAG_TEMP.eq.2) then !change bottom temp BC from I to f
+          ifc=1 !bottom face, if it was generated by genbox
+          do iel=1,nelt
+             if (cbc(ifc,iel,2) .eq. 'I  ') cbc(ifc,iel,2) = 'f  '
+          enddo
+      endif
+
+      if (IF_MVMESH) then  !change bottom BC from W to mv
+          ifc=1 !bottom face, if it was generated by genbox
+          do iel=1,nelt
+             if (cbc(ifc,iel,1) .eq. 'W  ') cbc(ifc,iel,1) = 'mv '
+          enddo
+          ifxyo     = .true.
+          ifmvbd    = .true.  ! moving boundary
+          ifusermv  = .true.  ! define our own mesh velocity
+      endif
+
+c
+      return
+      end
+      
+c-----------------------------------------------------------------------
+      subroutine usrdat3
+      include 'SIZE'
+      include 'TOTAL'
+
+      return
+      end
+
+c-----------------------------------------------------------------------
+
+      subroutine x_slice (ua,u,w1,w2)
+c
+c     Extract a x slice of quantity u() - assumes global tens.prod.
+c
+      include 'SIZE'
+      include 'GEOM'
+      include 'PARALLEL'
+      include 'WZ'
+      include 'ZPER'
+c
+      real ua(ny1,nz1,nely,nelz),u(nx1,ny1,nz1,nelt),
+     $     w1(ny1,nz1,nely,nelz),w2(ny1,nz1,nely,nelz)
+      integer e,eg,ex,ey,ez
+      real dy2
+c
+      myz = nely*nelz*ny1*nz1
+      call rzero(ua,myz)
+c
+      do e=1,nelt
+c
+         eg = lglel(e)
+         call get_exyz(ex,ey,ez,eg,nelx,nely,nelz)
+
+         i = 1
+         if (ex.eq.1) then
+            do k=1,nz1
+            do j=1,ny1
+               ua(j,k,ey,ez) = u(i,j,k,e)
+            enddo
+            enddo
+         endif
+      enddo
+
+      call gop(ua,w2,'+  ',myz)
+
+      return
+      end
+
+      subroutine x_slice2 (u,w1)
+c
+c     Extract a x slice of quantity u() - assumes global tens.prod.
+c     It doesn't return the result. 
+      include 'SIZE'
+      include 'GEOM'
+      include 'PARALLEL'
+      include 'WZ'
+      include 'ZPER'
+c
+      real u(nx1,ny1,nz1,nelt),
+     $     w1(ny1,nz1,nely,nelz)
+      integer nst,ist
+      integer e,eg,ex,ey,ez
+      real dy2
+C       real ua(ny1,nz1,nely,nelz)
+      common /xslice2/
+     &   ua(ly1,lz1,lely,lelz)
+c
+      myz = nely*nelz*ny1*nz1
+      call rzero(ua,myz)
+c
+      do e=1,nelt
+c
+         eg = lglel(e)
+         call get_exyz(ex,ey,ez,eg,nelx,nely,nelz)
+
+         i = 1
+         if (ex.eq.1) then
+            do k=1,nz1
+            do j=1,ny1
+               ua(j,k,ey,ez) = u(i,j,k,e)
+            enddo
+            enddo
+         endif
+      enddo
+
+      call gop(ua,w1,'+  ',myz)
+
+      return
+      end
+
+      subroutine x_slice3 (ua2)
+c
+c     Extract a x slice of quantity u() - assumes global tens.prod.
+c     It must be called RIGHT AFTER x_slice2
+      include 'SIZE'
+      include 'GEOM'
+      include 'PARALLEL'
+      include 'WZ'
+      include 'ZPER'
+c
+      real ua2(ny1,nz1,nely,nelz)
+      integer e,eg,ex,ey,ez
+      real dy2
+      common /xslice2/
+     &   ua(ly1,lz1,lely,lelz)
+
+c
+      myz = nely*nelz*ny1*nz1
+      call rzero(ua2,myz)
+
+      call copy(ua2,ua,myz)
+      return
+      end
+c---------------------------------------------------------------------      
+      subroutine y_line (ua,u,w1,w2)
+c
+c     Extract a y line of quantity u() - assumes global tens.prod.
+c
+      include 'SIZE'
+      include 'GEOM'
+      include 'PARALLEL'
+      include 'WZ'
+      include 'ZPER'
+c
+      real ua(ny1,nely),u(nx1,ny1,nz1,nelv)
+     $    ,w1(ny1,nely),w2(ny1,nely)
+      integer e,eg,ex,ey,ez
+      real dy2
+c
+      my = nely*ny1
+      call rzero(ua,my)
+c
+      do e=1,nelt
+c
+         eg = lglel(e)
+         call get_exyz(ex,ey,ez,eg,nelx,nely,nelz)
+         i = 1
+         k = 1
+         if (ex.eq.1 .and. ez.eq.1) then
+            do j=1,ny1
+               ua(j,ey) = u(i,j,k,e)
+            enddo
+         endif
+      enddo
+      call gop(ua,w2,'+  ',my)
+
+      return
+      end
+c--------------------------------------------------------------------- 
+      subroutine yslab (ua,u,w1,nslab,nely_in)
+c
+c     Extract a y line of quantity u() - assumes global tens.prod.
+c
+      include 'SIZE'
+      include 'GEOM'
+      include 'PARALLEL'
+      include 'WZ'
+      include 'ZPER'
+c
+      real ua(nslab),u(nx1,ny1,nz1,nelv)
+     $    ,w1(nslab)
+      integer e,eg,ex,ey,ez
+      real dy2
+c
+C       my = nely*ny1
+      call rzero(ua,nslab)
+c
+      do e=1,nelt
+c
+         eg = lglel(e)
+         call get_exyz(ex,ey,ez,eg,nelx,nely,nelz)
+         i = 1
+         k = 1
+         if (ex.eq.1 .and. ez.eq.1.and. ey.le.nely_in) then
+            do j=1,ny1
+               ua(j+ey*ny1-ny1) = u(i,j,k,e)-u(1,1,1,1)
+            enddo
+         endif
+      enddo
+      call gop(ua,w1,'+  ',nslab)
+
+      return
+      end     
+
+      subroutine y_slice (ua,u,w1)
+c
+c     Extract the bottom y slice of quantity u() - assumes global tens.prod.
+c
+      include 'SIZE'
+      include 'GEOM'
+      include 'PARALLEL'
+      include 'WZ'
+      include 'ZPER'
+c
+      real ua(nx1,nz1,nelx,nelz),u(nx1,ny1,nz1,nelt),
+     $     w1(nx1,nz1,nelx,nelz)
+      integer e,eg,ex,ey,ez, mxz
+      real dy2
+c
+      mxz = nelx*nelz*nx1*nz1
+      call rzero(ua,mxz)
+      call rzero(w1,mxz)
+c
+      do e=1,nelt
+c
+         eg = lglel(e)
+         call get_exyz(ex,ey,ez,eg,nelx,nely,nelz)
+
+         j = 1
+         if (ey.eq.1) then
+            do k=1,nz1
+            do i=1,nx1
+               ua(i,k,ex,ez) = u(i,j,k,e)
+            enddo
+            enddo
+         endif
+      enddo
+
+      call gop(ua,w1,'+  ',mxz)
+
+      return
+      end
+
+c----------------------------------------------------------------------------
+      subroutine output_means(atime,timel,dtime,w4,name)
+
+      include 'SIZE'
+      include 'TOTAL'
+      include 'ZPER'
+
+      real atime,timel,dtime
+      character*80 icfile,istepc
+      real w4(ly1,lz1,lely,lelz)
+      integer name
+
+      common /avgstats/
+     &  rumm(lx1,ly1,lz1,lelt,4)
+     & , ru2m(lx1,ly1,lz1,lelt,4)
+     & , ruvm(lx1,ly1,lz1,lelt,6)
+     & , ruxm(lx1,ly1,lz1,lelt,12)
+     & , rux2(lx1,ly1,lz1,lelt,12)
+     & , ru3m(lx1,ly1,lz1,lelt,4)
+     & , rv2u(lx1,ly1,lz1,lelt,6)
+     & , rpmm(lx1,ly1,lz1,lelt,4)
+     & , summ(lx1,ly1,lz1,lelt,4)
+     & , su2m(lx1,ly1,lz1,lelt,4)
+     & , suvm(lx1,ly1,lz1,lelt,6)
+     & , suxm(lx1,ly1,lz1,lelt,12)
+     & , sux2(lx1,ly1,lz1,lelt,12)
+     & , su3m(lx1,ly1,lz1,lelt,4)
+     & , sv2u(lx1,ly1,lz1,lelt,6)
+     & , spmm(lx1,ly1,lz1,lelt,4)
+     & , summ_2d(ly1,lz1,lely,lelz,4)
+     & , su2m_2d(ly1,lz1,lely,lelz,4)
+     & , suvm_2d(ly1,lz1,lely,lelz,6)
+     & , suxm_2d(ly1,lz1,lely,lelz,12)
+     & , sux2_2d(ly1,lz1,lely,lelz,12)
+     & , su3m_2d(ly1,lz1,lely,lelz,4)
+     & , sv2u_2d(ly1,lz1,lely,lelz,6)
+     & , spmm_2d(ly1,lz1,lely,lelz,4)
+
+
+       m=ny1*nz1*lely*lelz
+       if(nid.eq.0) then
+          write(*,*)'*********Writing statistics.......*********'
+          write(istepc,'(i32)') name
+          istepc=adjustl(istepc)
+          icfile=trim('means.'//trim(istepc))
+          open(unit=58,file=icfile,access='stream',form='unformatted')
+          write(58) (time-mean_time_start),atime,timel,dtime
+          write(58) int(nx1),int(lelx),int(lely),int(lelz)
+          do i=1,4
+            call copy(w4,summ_2d(1,1,1,1,i),m)
+            write(58) w4
+          enddo
+          do i=1,4
+            call copy(w4,su2m_2d(1,1,1,1,i),m)
+            write(58) w4
+         enddo
+          do i=1,6
+            call copy(w4,suvm_2d(1,1,1,1,i),m)
+            write(58) w4
+          enddo
+          do i=1,12
+            call copy(w4,suxm_2d(1,1,1,1,i),m)
+            write(58) w4
+          enddo
+          do i=1,12
+            call copy(w4,sux2_2d(1,1,1,1,i),m)
+            write(58) w4
+          enddo
+          do i=1,4
+            call copy(w4,su3m_2d(1,1,1,1,i),m)
+            write(58) w4
+         enddo
+         do i=1,6
+            call copy(w4,sv2u_2d(1,1,1,1,i),m)
+            write(58) w4
+         enddo
+         do i=1,4
+            call copy(w4,spmm_2d(1,1,1,1,i),m)
+            write(58) w4
+         enddo
+          close(58)
+       endif
+       return
+       end
+
+c----------------------------------------------------------------------------
+      subroutine input_means()
+      include 'SIZE'
+      include 'TOTAL'
+      include 'ZPER'
+
+      real w4(ly1,lz1,lely,lelz)
+      integer dumm
+
+      common /avgstats_old/
+     &  summ_2d_o(ly1,lz1,lely,lelz,4)
+     & , su2m_2d_o(ly1,lz1,lely,lelz,4)
+     & , suvm_2d_o(ly1,lz1,lely,lelz,6)
+     & , suxm_2d_o(ly1,lz1,lely,lelz,12)
+     & , sux2_2d_o(ly1,lz1,lely,lelz,12)
+     & , su3m_2d_o(lx1,ly1,lz1,lelt,4)
+     & , sv2u_2d_o(lx1,ly1,lz1,lelt,6)
+     & , spmm_2d_o(lx1,ly1,lz1,lelt,4)
+     & ,timem,atimem,timelm,dtimem,t_tot
+
+      m=ny1*nz1*lely*lelz
+
+      call rzero(summ_2d_o,size(summ_2d_o))
+      call rzero(su2m_2d_o,size(su2m_2d_o))
+      call rzero(suvm_2d_o,size(suvm_2d_o))
+      call rzero(suxm_2d_o,size(suxm_2d_o))
+      call rzero(sux2_2d_o,size(sux2_2d_o))
+      call rzero(su3m_2d_o,size(su3m_2d_o))
+      call rzero(sv2u_2d_o,size(sv2u_2d_o))
+      call rzero(spmm_2d_o,size(spmm_2d_o))
+
+      if (nid.eq.0) then
+         write(*,*)'*********Reading means file: means.ini....*********'
+         open(unit=58,file='means.ini',access='stream',
+     &     form='unformatted')
+         read(58) timem,atimem,timelm,dtimem
+         read(58) dumm,dumm,dumm,dumm
+         do i=1,4
+          read(58) w4
+          call copy(summ_2d_o(1,1,1,1,i),w4,m)
+         enddo
+         do i=1,4
+          read(58) w4
+          call copy(su2m_2d_o(1,1,1,1,i),w4,m)
+         enddo
+         do i=1,6
+          read(58) w4
+          call copy(suvm_2d_o(1,1,1,1,i),w4,m)
+         enddo
+         do i=1,12
+          read(58) w4
+          call copy(suxm_2d_o(1,1,1,1,i),w4,m)
+         enddo
+         do i=1,12
+          read(58) w4
+          call copy(sux2_2d_o(1,1,1,1,i),w4,m)
+         enddo
+         do i=1,4
+            read(58) w4
+            call copy(su3m_2d_o(1,1,1,1,i),w4,m)
+         enddo
+         do i=1,6
+            read(58) w4
+            call copy(sv2u_2d_o(1,1,1,1,i),w4,m)
+         enddo
+         do i=1,4
+            read(58) w4
+            call copy(spmm_2d_o(1,1,1,1,i),w4,m)
+         enddo
+         close(58)
+       endif
+C       do i=1,4
+C           call gop(summ_2d_o(1,1,1,1,i),w4,'+  ',m)
+C       enddo
+C       do i=1,4
+C           call gop(su2m_2d_o(1,1,1,1,i),w4,'+  ',m)
+C       enddo
+C       do i=1,6
+C           call gop(suvm_2d_o(1,1,1,1,i),w4,'+  ',m)
+C       enddo
+C       do i=1,12
+C           call gop(suxm_2d_o(1,1,1,1,i),w4,'+  ',m)
+C       enddo
+C       do i=1,12
+C           call gop(sux2_2d_o(1,1,1,1,i),w4,'+  ',m)
+C       enddo
+C       do i=1,4
+C           call gop(su3m_2d_o(1,1,1,1,i),w4,'+  ',m)
+C       enddo
+C       do i=1,6
+C           call gop(sv2u_2d_o(1,1,1,1,i),w4,'+  ',m)
+C       enddo
+C       do i=1,4
+C           call gop(spmm_2d_o(1,1,1,1,i),w4,'+  ',m)
+C       enddo
+      return
+      end
+
+      subroutine print_yz_mesh
+
+      include 'SIZE'
+      include 'GEOM'
+      include 'PARALLEL'
+      include 'WZ'
+      include 'ZPER'
+
+
+      real ymm(ly1,lz1,lely,lelz),zmm(ly1,lz1,lely,lelz)
+
+c     xmm --> yz slice; ymm --> xz slice; zmm --> xy slice  
+
+      real w1(ly1,lz1,lely,lelz),w2(ly1,lz1,lely,lelz)
+
+
+      call x_slice(ymm,ym1,w1,w2)
+      call x_slice(zmm,zm1,w1,w2)
+
+      if(nid.eq.0) then
+          write(*,*)'*********Writing y-z plane mesh.......*********'
+          write(istepc,'(i32)') istep
+          open(unit=58,file='yzmesh.dat',
+     &       access='stream',form='unformatted')
+          write(58)ly1,lz1,lely,lelz
+          write(58)ymm,zmm
+          close(58)
+      endif
+      return
+      end
+
+c-----------------------------------------------------------------------
+      subroutine print_xz_mesh
+
+      include 'SIZE'
+      include 'GEOM'
+      include 'PARALLEL'
+      include 'WZ'
+      include 'ZPER'
+
+
+      real zmm(lx1,lz1,lelx,lelz),xmm(lx1,lz1,lelx,lelz)
+
+c     xmm --> yz slice; ymm --> xz slice; zmm --> xy slice  
+
+      real w1(lx1,lz1,lelx,lelz)
+
+
+      call y_slice(zmm,zm1,w1)
+      call y_slice(xmm,xm1,w1)
+
+      if(nid.eq.0) then
+          write(*,*)'*********Writing x-z plane mesh.......*********'
+          write(istepc,'(i32)') istep
+          open(unit=58,file='xzmesh.dat',
+     &       access='stream',form='unformatted')
+          write(58)lx1,lz1,lelx,lelz
+          write(58)xmm,zmm
+          close(58)
+      endif
+      return
+      end
+
+      subroutine output_2d(timel,um,vm,tm)
+
+       include 'SIZE'
+       include 'TOTAL'
+       include 'ZPER'
+
+       real timel
+       real um(ly1,lz1,lely,lelz),vm(ly1,lz1,lely,lelz),
+     &      tm(ly1,lz1,lely,lelz)
+       character*80 icfile,istepc
+
+       if(nid.eq.0) then
+          write(*,*)'******Writing spanwise-averaged file....*******'
+          write(istepc,'(i32)') istep
+          istepc=adjustl(istepc)
+          icfile=trim('2dmeans.'//trim(istepc))
+          open(unit=58,file=icfile,access='stream',form='unformatted')
+          write(58) time
+          write(58) int(nx1),int(lelx),int(lely),int(lelz)
+          write(58)um
+          write(58)vm
+          write(58)tm
+          close(58)
+       endif
+       return
+       end
+
+      subroutine shields(sh_x,sh_z,sh_cr,btuy,btwy,th_x,th_z,repd,cvd)
+      include 'SIZE'
+      include 'TOTAL'
+      include 'ZPER'
+
+      real btuy(lx1,lz1,lelx,lelz),btwy(lx1,lz1,lelx,lelz)
+      real sh_x(lx1,lz1,lelx,lelz),sh_z(lx1,lz1,lelx,lelz),
+     &     sh_cr(lx1,lz1,lelx,lelz) 
+      real th_x(lx1,lz1,lelx,lelz),th_z(lx1,lz1,lelx,lelz)
+      real repd,cvd
+      real dum,sh_cr0,gamma,beta,tan_cr, diamd
+      integer n,i
+      n=lx1*lz1*lelx*lelz
+      call rzero(sh_x,n)
+      call rzero(sh_z,n)
+      call rzero(sh_cr,n)
+
+      if (V_SETTLING.ne.0.0) then
+        diamd=DIAM
+      else
+        dum=sin(atan(1.0/RITAU))*cvd
+        diamd=(dum/((RE_TAU/repd)**2))**(1.0/3.0)
+        if (nid.eq.0 .and. istep.eq.0) write(*,*)'Rep=',repd,'d=',diamd
+      endif
+
+      do i=1,n
+        sh_x(i,1,1,1)=(diamd**2*RE_TAU/repd**2)*btuy(i,1,1,1)
+        sh_z(i,1,1,1)=(diamd**2*RE_TAU/repd**2)*btwy(i,1,1,1)
+      enddo
+
+      sh_cr0=(0.22*repd**(-0.6)+0.06*exp(-17.77*repd**(-0.6)))*0.5
+      
+      if(IF_SHCR_VAR) then
+      tan_cr=tan(PI/6.0)
+        do i=1,n
+          gamma=atan2(btwy(i,1,1,1),btuy(i,1,1,1))
+          beta=th_z(i,1,1,1)*cos(gamma)+th_x(i,1,1,1)*sin(gamma)
+          sh_cr(i,1,1,1)=sh_cr0*abs(cos(beta)*(1+(tan(beta)/tan_cr)))
+        enddo
+      else
+        do i=1,n
+          sh_cr(i,1,1,1)=sh_cr0
+        enddo
+      endif
+
+      return
+      end
+
+      subroutine sediment_flux(sh_x,sh_z,sh_cr,qbx,qbz,repd)
+      include 'SIZE'
+      include 'TOTAL'
+      include 'ZPER'
+
+      real sh_x(lx1,lz1,lelx,lelz),sh_z(lx1,lz1,lelx,lelz),
+     &     sh_cr(lx1,lz1,lelx,lelz)  
+      real qbx(lx1,lz1,lelx,lelz),qbz(lx1,lz1,lelx,lelz)
+      real w1(lx1,lz1,lelx,lelz) 
+      real repd
+      real dum, dumx, dumz, dumrp
+      integer n,i
+
+      n=lx1*lz1*lelx*lelz
+
+      call rzero(w1,n)
+      call rzero(qbx,n)
+      call rzero(qbz,n)
+
+      do i=1,n
+        dum=(sh_x(i,1,1,1)**2+sh_z(i,1,1,1)**2)**0.5
+        if (dum.ge.sh_cr(i,1,1,1)) then
+        dumx=sh_x(i,1,1,1)/dum
+        dumz=sh_z(i,1,1,1)/dum
+        qbx(i,1,1,1)=(repd/RE_TAU)*4.93*dumx*(dum-sh_cr(i,1,1,1))**1.6 !Wong & Parker MPM
+        qbz(i,1,1,1)=(repd/RE_TAU)*4.93*dumz*(dum-sh_cr(i,1,1,1))**1.6
+        endif
+      enddo 
+
+C       call gop(qbx,w1,'+  ',n)
+C       call rzero(w1,n)
+C       call gop(qbz,w1,'+  ',n)
+      return
+      end     
+
+
+      subroutine parker_erosion(btuy,btwy)
+      include 'SIZE'
+      include 'TOTAL'
+      include 'ZPER'
+
+      real btuy(lx1,lz1,lelx,lelz),btwy(lx1,lz1,lelx,lelz)
+      real dum,zp,A,repd,cvd
+      integer n,i
+
+      common /erosion/ E_s(lx1,lz1,lelx,lelz)
+
+      n=lx1*lz1*lelx*lelz
+      if (V_SETTLING.ne.0.0) then
+        cvd=Cv
+        repd=RE_P
+      else
+        cvd=0.0
+        repd=0.3
+      endif
+
+      call rzero(E_s,n)
+
+      A=1.3E-7
+      do i=1,n
+        zp=18.0*(repd**-1.4)*DIAM*(RE_TAU*(btuy(i,1,1,1)**2+
+     &              btwy(i,1,1,1)**2)**0.5)**0.5
+        E_s(i,1,1,1)=(A*zp**5)/(1.0+10.0*A*zp**5)
+      enddo
+C       call gop(E_s,w1,'+  ',n)
+      return
+      end
+
+      subroutine bottom_copy(u,wo1)
+c     This copies a 2d x-z array at the bottom of a 3d v-mesh, to allow the use of gradm1
+      include 'SIZE'
+      include 'GEOM'
+      include 'ZPER'
+      include 'PARALLEL'
+      include 'WZ'
+
+
+      real u(lx1,lz1,lelx,lelz)
+      real wo1(lx1,ly1,lz1,lelv)
+      integer e,eg,ex,ey,ez
+
+
+      nxz=lx1*lz1*lelx*lelz
+      nxyz=lx1*lz1*ly1*lelt
+      call rzero(wo1,nxyz)
+
+      do e=1,nelt
+         eg = lglel(e)
+         call get_exyz(ex,ey,ez,eg,nelx,nely,nelz)
+          do k=1,nz1
+            do j=1,ny1
+              do i=1,nx1
+                wo1(i,j,k,e) = u(i,k,ex,ez)
+              enddo
+            enddo
+          enddo
+      enddo
+      return
+      end
+
+      subroutine temp_threshold(tem,thr)
+      include 'SIZE'
+      include 'TOTAL'
+      include 'ZPER'
+
+      real tem(lx1,ly1,lz1,lelv),thr(lx1,ly1,lz1,lelv)
+
+      call rzero(thr,lx1*ly1*lz1*lelv)
+      do i=1,lx1*ly1*lz1*lelv
+        if (tem(i,1,1,1).gt.THRESHOLD) then
+        thr(i,1,1,1)= 1.0
+        endif
+      enddo
+      return
+      end
+
+      subroutine bed_angle(eta,th_x,th_z,lap_e,w1,w2,w3,w4,wxz1,wxz2,
+     &  x,z)
+      include 'SIZE'
+      include 'TOTAL'
+      include 'ZPER'
+
+      real eta(lx1,lz1,lelx,lelz)
+      real th_z(lx1,lz1,lelx,lelz),th_x(lx1,lz1,lelx,lelz),
+     &     lap_e(lx1,lz1,lelx,lelz)
+      real wxz1(lx1,lz1,lelx,lelz),wxz2(lx1,lz1,lelx,lelz)
+      real w1(lx1,ly1,lz1,lelv),w2(lx1,ly1,lz1,lelv),
+     &     w3(lx1,ly1,lz1,lelv),w4(lx1,ly1,lz1,lelv)
+      real x(lx1,lz1,lelx,lelz),z(lx1,lz1,lelx,lelz)
+      real wxz3(lx1,lz1,lelx,lelz)
+
+
+      integer i,nxz,nt,ex
+
+      nxz=lx1*lz1*lelx*lelz
+      nt=lx1*ly1*lz1*lelv
+
+      call bottom_copy(eta,w4)
+      call gradm1(w1,w2,w3,w4)
+
+      call y_slice(th_x,w1,wxz1)        ! tan(theta_x)
+      call y_slice(th_z,w3,wxz1)        ! tan(theta_z)
+
+      call bed_filter(th_x,z,x,0)
+      call bed_filter(th_z,z,x,0)
+
+      call bottom_copy(th_z,w4)
+      call gradm1(w1,w2,w3,w4)   !d2eta/dzz
+      call y_slice(lap_e,w3,wxz1)
+
+      call bottom_copy(th_x,w4)
+      call gradm1(w1,w2,w3,w4)   !d2eta/dxx
+      call y_slice(wxz3,w1,wxz1)
+      call add2(lap_e,wxz3,nxz)      
+
+
+      do i =1,nxz
+        th_x(i,1,1,1)=atan(th_x(i,1,1,1))
+        th_z(i,1,1,1)=atan(th_z(i,1,1,1))
+      enddo
+
+      call bed_filter(lap_e,z,x,0)
+      return
+      end
+
+      subroutine B_eta_s(B,th_x,th_z)
+c      Proporcionality constant between concentration and sediment height
+      include 'SIZE'
+      include 'TOTAL'
+      include 'ZPER'
+
+      real B(lx1,lz1,lelx,lelz),
+     &     th_x(lx1,lz1,lelx,lelz),th_z(lx1,lz1,lelx,lelz)
+      real cvd
+      integer n,i
+
+      n=lx1*lz1*lelx*lelz
+      cvd=Cv
+
+      do i=1,n
+        B(i,1,1,1)=dcos(th_x(i,1,1,1))*dcos(th_z(i,1,1,1))*cvd
+      enddo
+      return
+      end
+
+      subroutine q_integral_s(q_int,qbz,qbx,w1,w2,igs_x,igs_z)
+
+      include 'SIZE'
+      include 'TOTAL'
+      include 'ZPER'
+
+      real q_int
+      real qbx(lx1,lz1,lelx,lelz),qbz(lx1,lz1,lelx,lelz)
+      real q_thr(lx1,lz1,lelx,lelz)
+      real w1(lx1,ly1,lz1,lelv),w2(lx1,ly1,lz1,lelv)
+      integer igs_z,igs_x
+      real q_mod,wght,dum, thres
+      integer e,eg,ex,ey,ez,i
+
+      q_int=0.0
+      wght=0.0
+      thres=0.000001
+      nxz=lx1*lz1*lelx*lelz
+      call rzero(q_thr,nxz)
+
+      do i=1,nxz
+        q_mod=(qbx(i,1,1,1)**2+qbz(i,1,1,1)**2)**0.5
+        if (q_mod.ge.thres) q_thr(i,1,1,1)=q_mod 
+      enddo
+      call bottom_copy(q_thr,w1)
+      call planar_avg(w2,w1,igs_z)
+      call rzero(w1,size(w1))
+      call planar_avg(w1,w2,igs_x)
+      q_int=w1(1,1,1,1)
+
+      
+      return
+      end
+
+      subroutine read_bed(wxz)
+      include 'SIZE'
+      include 'TOTAL'
+      include 'ZPER'
+
+      real wxz(lx1,lz1,lelx,lelz)
+      real rdum
+      integer idum, type, nxz
+
+      common /heights/ eta(lx1,lz1,lelx,lelz),
+     &               eta_e(lx1,lz1,lelx,lelz),
+     &               eta_d(lx1,lz1,lelx,lelz),
+     &               eta_q(lx1,lz1,lelx,lelz)
+
+      nxz=lx1*lz1*lelx*lelz
+      call rzero(eta,nxz)
+      call rzero(eta_q,nxz)
+      call rzero(eta_q2,nxz)
+      call rzero(eta_q3,nxz)
+      call rzero(eta_cb,nxz)
+      call rzero(eta_qcb,nxz)
+      call rzero(eta_es,nxz)
+
+
+      if (nid.eq.0) then
+          write(*,*)'###### Reading bedform file for restart ####'
+          open(unit=58,file='bedform.ini',access='stream',
+     &       form='unformatted')
+          read(58) idum,idum,idum,idum
+          read(58) type
+          write(*,*) 'File contents type:', type
+          read(58) rdum
+          read(58) w2, w2, w2 !Es int_t btt
+          read(58) eta_q
+          read(58) w2, w2
+          if (type .eq. 1 .or. type.eq.-1) read(58) w2, w2, w2, w2, w2
+          if (type .eq. -1) read(58) eta_q2, w2, w2, w2, w2, w2
+          if (type .eq. -1) read(58) eta_q3, w2, w2, w2, w2, w2
+          read(58) eta
+          if (type .eq. 1) read(58) w2, w2, w2, w2, w2
+          read(58) eta_escb
+          if (type .eq. 1) read(58) w2, w2
+          read(58) eta_qcb
+          if (type .eq. 1) read(58) w2, w2, w2, w2, w2
+          read(58) eta_es
+          read(58) eta_cb
+          if (type .eq. 1) read(58) w2, w2
+          close(58)
+          write(*,*)'FILE: bedform.ini'
+          write(*,*)'###### Reading bedform file for restart done ###'
+        endif
+      call rzero(wxz,nxz)
+      call gop(eta,wxz,'+  ',nxz)
+      call rzero(wxz,nxz)
+      call gop(eta_q,wxz,'+  ',nxz)
+      call rzero(wxz,nxz)
+      call gop(eta_q2,wxz,'+  ',nxz)
+      call rzero(wxz,nxz)
+      call gop(eta_q3,wxz,'+  ',nxz)
+      call rzero(wxz,nxz)
+      call gop(eta_cb,wxz,'+  ',nxz)
+      call rzero(wxz,nxz)
+      call gop(eta_escb,wxz,'+  ',nxz)
+      call rzero(wxz,nxz)
+      call gop(eta_qcb,wxz,'+  ',nxz)
+      call rzero(wxz,nxz)
+      call gop(eta_es,wxz,'+  ',nxz)
+      return
+      end
+
+      subroutine bed_filter(h, z, x,type)
+      include 'SIZE'
+      include 'TOTAL'
+      include 'ZPER'
+
+      real h(lx1,lz1,lelx,lelz)
+      real z(lx1,lz1,lelx,lelz),x(lx1,lz1,lelx,lelz)
+C       real w1(lx1,lz1,lelx,lelz)
+      integer type
+      real x_s(5),z_s(5),y_s(2)
+      real xl,xm,xp,xr,zl,zm,zp,zr,z0,x0
+      real dumm,xlen
+      integer i,j,ex,ez
+      integer per_x, per_z
+      !type=1 replace lx-1,lx1,1,2
+      !type=0 replace lx1,1
+      per_x=1
+
+      if (type.eq.1) then
+        zl=z(1,lz1-2,1,1)-z(1,lz1,1,1)
+        zm=z(1,lz1-1,1,1)-z(1,lz1,1,1)
+        z0=0.0
+        zp=z(1,2,1,1)
+        zr=z(1,3,1,1)
+
+        xl=x(lx1-2,1,1,1)-x(lx1,1,1,1)
+        xm=x(lx1-1,1,1,1)-x(lx1,1,1,1)
+        x0=0.0
+        xp=x(2,1,1,1)
+        xr=x(3,1,1,1)
+      else
+        zl=z(1,lz1-2,1,1)-z(1,lz1,1,1)
+        z0=0.0
+        zr=z(1,2,1,1)
+
+        xl=x(lx1-1,1,1,1)-x(lx1,1,1,1)
+        x0=0.0
+        xr=x(2,1,1,1)
+      endif  
+
+      do ez=1,lelz-1
+        do ex=1,lelx
+C           first on z
+          do i=1,lz1         !could be done up to lx1-1
+            if (type.eq.1) then
+              y_s(1)=h(i,lz1-2,ex,ez  )
+              y_s(2)=h(i,3,    ex,ez+1)
+            else
+              y_s(1)=h(i,lz1-1,ex,ez  )
+              y_s(2)=h(i,2,    ex,ez+1)
+            endif
+            dumm=y_s(1)*(zr-z0)+y_s(2)*(z0-zl)
+            h(i,lz1,ex,ez)=dumm/(zr-zl)
+            h(i,1,ex,ez+1)=dumm/(zr-zl)
+            if (type.eq.1) then
+              dumm=y_s(1)*(zr-zm)+y_s(2)*(zm-zl)
+              h(i,lz1-1,ex,ez)=dumm/(zr-zl)
+              dumm=y_s(1)*(zr-zp)+y_s(2)*(zp-zl)
+              h(i,2,ex,ez+1)=dumm/(zr-zl)
+            endif
+          enddo
+        enddo
+      enddo
+
+      do ez=1,lelz
+        do ex=1,lelx-1
+C           now x
+          do j=1,lx1         !could be done up to lx1-1
+            if (type.eq.1) then
+              y_s(1)=h(lz1-2,j,ex,ez  )
+              y_s(2)=h(3,j,    ex+1,ez)
+            else
+              y_s(1)=h(lz1-1,j,ex,ez  )
+              y_s(2)=h(2,    j,ex+1,ez)
+            endif
+            dumm=y_s(1)*(xr-x0)+y_s(2)*(x0-xl)
+            h(lx1,j,ex,ez)=dumm/(xr-xl)
+            h(1,j,ex+1,ez)=dumm/(xr-xl)
+            if (type.eq.1) then
+              dumm=y_s(1)*(xr-xm)+y_s(2)*(xm-xl)
+              h(lx1-1,j,ex,ez)=dumm/(xr-xl)
+              dumm=y_s(1)*(xr-xp)+y_s(2)*(xp-xl)
+              h(2,j,ex+1,ez)=dumm/(xr-xl)
+            endif
+          enddo
+        enddo
+      enddo
+     
+      if (per_x.eq.1) then
+        do ez=1,lelz
+          do j=1,lx1         !could be done up to lx1-1
+            if (type.eq.1) then
+              y_s(1)=h(lz1-2,j,lelx,ez  )
+              y_s(2)=h(3,j,    1,ez)
+            else
+              y_s(1)=h(lz1-1,j,lelx,ez  )
+              y_s(2)=h(2,    j,1,ez)
+            endif
+            dumm=y_s(1)*(xr-x0)+y_s(2)*(x0-xl)
+            h(lz1,j,lelx,ez)=dumm/(xr-xl)
+            h(1,j,1,ez)=dumm/(xr-xl)
+            if (type.eq.1) then
+              dumm=y_s(1)*(xr-xm)+y_s(2)*(xm-xl)
+              h(lz1-1,j,lelx,ez)=dumm/(xr-xl)
+              dumm=y_s(1)*(xr-xp)+y_s(2)*(xp-xl)
+              h(2,j,1,ez)=dumm/(xr-xl)
+            endif
+          enddo
+        enddo
+      endif
+
+      return
+      end
+      
+      subroutine bedform_calcs(btwy,btuy,btt,xbmm,zbmm,wo1,wo2,wo3,wo4,
+     &                        igs_x,igs_y,igs_z,
+     &                     wxz1,wxz2,wxz3,sh_x,sh_z,sh_cr,qbx,qbz,int_t,
+     &               qbxx,qbzz,theta_bedx,theta_bedz,B_eta, lap_eta)
+
+      include 'SIZE'
+      include 'TOTAL'
+      include 'ZPER'
+
+      real btwy(lx1,lz1,lelx,lelz),btuy(lx1,lz1,lelx,lelz),
+     &     btt(lx1,lz1,lelx,lelz),
+     &     zbmm(lx1,lz1,lelx,lelz),xbmm(lx1,lz1,lelx,lelz)
+
+      real wo1(lx1,ly1,lz1,lelv)
+     &      ,  wo2(lx1,ly1,lz1,lelv)
+     &      ,  wo3(lx1,ly1,lz1,lelv)
+     &      ,  wo4(lx1,ly1,lz1,lelv)     
+
+      integer igs_x, igs_y, igs_z
+
+      common /heights/ eta(lx1,lz1,lelx,lelz),
+     &               eta_e(lx1,lz1,lelx,lelz),
+     &               eta_d(lx1,lz1,lelx,lelz),
+     &               eta_q(lx1,lz1,lelx,lelz)
+
+
+      common /erosion/ E_s(lx1,lz1,lelx,lelz) 
+      common /ab2/ femm(lx1,lz1,lelx,lelz),
+     &    fem(lx1,lz1,lelx,lelz), base_eta1(lx1,lz1,lelx,lelz),
+     &    femm_e(lx1,lz1,lelx,lelz), fem_e(lx1,lz1,lelx,lelz), 
+     &    femm_d(lx1,lz1,lelx,lelz), fem_d(lx1,lz1,lelx,lelz), 
+     &    femm_q(lx1,lz1,lelx,lelz), fem_q(lx1,lz1,lelx,lelz),
+     &    base_eta2(lx1,lz1,lelx,lelz)
+      common /ab2_2/ dtmm, dtm, izb1, ezb1, izb2, ezb2
+
+
+      common /eta_mvbc/ umeshx(lx1,ly1,lz1,lelv)
+     &              , umeshy(lx1,ly1,lz1,lelv)
+     &              , umeshz(lx1,ly1,lz1,lelv)
+     &              , rhs(lx1,lz1,lelx,lelz)
+
+      real wxz1(lx1,lz1,lelx,lelz),wxz2(lx1,lz1,lelx,lelz), 
+     &     wxz3(lx1,lz1,lelx,lelz),!working arrays
+     &     sh_x(lx1,lz1,lelx,lelz),  !Shields number
+     &     sh_z(lx1,lz1,lelx,lelz),  !Shields number
+     &     sh_cr(lx1,lz1,lelx,lelz),  !Critical Shields number
+     &     qbx(lx1,lz1,lelx,lelz),   !Bottom sediment flux
+     &     qbz(lx1,lz1,lelx,lelz),  !Bottom sediment flux
+     &     int_t(lx1,lz1,lelx,lelz),
+     &     qbxx(lx1,lz1,lelx,lelz),
+     &     qbzz(lx1,lz1,lelx,lelz),
+     &     theta_bedx(lx1,lz1,lelx,lelz),
+     &     theta_bedz(lx1,lz1,lelx,lelz),
+     &     B_eta(lx1,lz1,lelx,lelz),
+     &     lap_eta(lx1,lz1,lelx,lelz)
+     
+
+      real q_integral, dtimestep,cvd,repd(3),eps(3),zbu(2),rhsm_in,dumm
+      integer e,ex,ez,ey,eg
+      real vol_in
+      save vol_in
+
+      parameter (lx1tp=2*lx1+1)
+      real kernelx_q(lx1,lx1tp), kernelz_q(lx1,lx1tp)
+      save kernelx_q,kernelz_q
+      integer mask_gf(lx1,lx1tp,2)
+      save mask_gf
+
+      character*32 istepc,outfile
+      character*80 icfile
+      integer nxz,i, if_write, mvs,j,k,n
+      integer counter_bed
+      save counter_bed
+
+
+      dtimestep = abs(dt)
+      nxz=lx1*lz1*lelx*lelz
+      n=lx1*ly1*lz1*lelv
+
+      if (V_SETTLING.ne.0.0) then
+        cvd=Cv
+        repd(1)=RE_P
+        mvs=1
+      else
+        cvd=0.005
+        repd(1)=0.3
+        repd(2)=1.8
+        repd(3)=3.0
+        mvs=3
+      endif
+
+      if (istep.eq.0) then
+      call rzero(rhs,size(rhs))
+        zbu(1) = IN_ZL
+        zbu(2) = OUT_ZL
+      do i=1,nxz
+       base_eta1(i,1,1,1)=1.0
+       base_eta2(i,1,1,1)=1.0
+       if (zbmm(i,1,1,1).le.zbu(1)) then 
+        base_eta1(i,1,1,1)=zbmm(i,1,1,1)/zbu(1)
+        base_eta1(i,1,1,1)=base_eta1(i,1,1,1)**2.0
+       endif
+       if (zbmm(i,1,1,1).gt.(ZLEN-zbu(2))) then
+        base_eta2(i,1,1,1)=(-1.0/zbu(2))*(zbmm(i,1,1,1)-ZLEN
+     &                   +zbu(2))+1.0
+        base_eta2(i,1,1,1)=base_eta2(i,1,1,1)**2.0
+       endif
+      enddo
+      vol_in=0.0
+      dumm=0.0
+      do e=1,nelv
+       eg = lglel(e)
+         call get_exyz(ex,ey,ez,eg,nelx,nely,nelz)
+          do k=1,nz1
+            do j=1,ly1
+                do i=1,nx1
+                  if (zbmm(i,k,ex,ez).gt.IN_ZL .and. 
+     &                zbmm(i,k,ex,ez) .lt. (IN_ZL*1.5)) then
+                    vol_in=vol_in+bm1(i,j,k,e)
+                  endif
+                enddo
+              enddo
+           enddo
+      enddo
+      call gop(vol_in,dumm,'+  ',1)
+
+      do ez=1,lelz
+       do i=1,lz1
+        izb2 = i
+        ezb2 = ez
+        if (zbmm(1,i,1,ez).gt.(ZLEN-zbu(2))) exit 
+       enddo
+      enddo
+      do ez=1,lelz
+       do i=1,lz1
+        izb1 = i
+        ezb1 = ez
+        if (zbmm(1,i,1,ez).gt.(zbu(1))) exit 
+       enddo
+      enddo
+
+      endif !istep.eq.0
+
+      if (istep.eq.0) counter_bed=0
+      if_write=0
+      if (nid.eq.0) then
+      if (param(15).ne.0) then !writeControl = numStep
+        write(istepc,'(i32)') istep
+        istepc=adjustl(istepc)
+        icfile=trim('bed.'//trim(istepc))
+        if (mod(istep,int(iostep_bed)).eq.0) then 
+          if_write = 1
+        else
+          if_write = 0
+        endif
+      else !writeControl = runTime
+        write(istepc,'(i32)') counter_bed
+        istepc=adjustl(istepc)
+        icfile=trim('bed.'//trim(istepc))
+
+       if (iostep_bed*aint(time/iostep_bed).ge.counter_bed*iostep_bed)
+     &    then 
+          if_write = 1
+          counter_bed = counter_bed +1 
+        else
+          if_write = 0
+       endif
+      endif
+      endif
+      do i=1,nxz
+        if (btt(i,1,1,1).lt.0.0) btt(i,1,1,1)=0.0
+      enddo
+
+      q_integral = 0.0
+
+      call bed_angle(eta,theta_bedx,theta_bedz,lap_eta,
+     &               wo1,wo2,wo3,wo4,wxz1,wxz2,xbmm,zbmm) !compute bedform angles (in radians!) and eta laplacian.
+
+C       if (istep.eq.0) call set_mean_filter(zbmm, xbmm, WDW_EXNER_RHS,1)
+C       if (istep.eq.0) call set_mean_filter(zbmm, xbmm, WDW_EXNER_Q,2)
+      if(IF_DIVQ) then
+        if (istep.eq.0) call gaussian_filter_setup(zbmm,xbmm,
+     &  zbmm(1,lx1,1,1)/STD_EXNER_QZ,xbmm(lx1,1,1,1)/STD_EXNER_QX,
+     &  kernelz_q,kernelx_q,mask_gf) 
+
+        call shields(sh_x,sh_z,sh_cr,btuy,btwy,theta_bedx,theta_bedz,
+     &                                                     repd(1),cvd)       !compute Shields and Critical Shields number
+        call bed_filter(sh_cr, zbmm, xbmm,0)
+        call sediment_flux(sh_x,sh_z,sh_cr,qbx,qbz,repd(1)) !compute bottom sediment flux (Wong & Parker MPM)
+C     Sediment flux gradient
+        call bottom_copy(qbx,wo4)
+        call gradm1(wo1,wo2,wo3,wo4)
+        call y_slice(qbxx,wo1,wxz1)        ! dqbx/dx
+        call bed_filter(qbxx, zbmm, xbmm,0)
+
+        call bottom_copy(qbz,wo4)
+        call gradm1(wo1,wo2,wo3,wo4)
+        call y_slice(qbzz,wo3,wxz1)        ! dqbz/dz
+        call bed_filter(qbzz, zbmm, xbmm,0)
+
+C       call q_integral_s(q_integral,qbz,qbx,wo1,wo2,igs_x,igs_z)
+        call add3(wxz1,qbxx,qbzz,nxz)      ! div dot q
+        call gaussian_filter(wxz1,kernelz_q, kernelx_q,mask_gf)   !wxz1 -> div dot q
+      else
+        call rzero(wxz1,nxz) !wxz1 -> div dot q
+      endif
+
+      if(IF_DEPO) then 
+        call B_eta_s(B_eta,theta_bedx,theta_bedz)   !Proportionality constant between concentration and sediment height
+      else
+        call rzero(B_eta,nxz)
+      endif
+
+      if (IF_EROS) then
+        call copy(wxz3,E_s,nxz) !wxz3 -> erosion
+      else
+        call rzero(wxz3,nxz) !wxz3 -> erosion
+      endif
+
+
+      do i=1,nxz
+        wxz2(i,1,1,1)= (EPS_EXNER*lap_eta(i,1,1,1) !lap eta
+     &               -cvd*abs(V_SETTLING*wxz3(i,1,1,1))  !E_s
+     &               +V_SETTLING*B_eta(i,1,1,1)*btt(i,1,1,1) !c_b
+     &               -wxz1(i,1,1,1)) ! div.q
+        wxz2(i,1,1,1)=wxz2(i,1,1,1)/PACKING_FR
+      enddo
+
+C     fix inlet
+      do i=1,nxz
+        wxz3(i,1,1,1)=0.0
+        if (zbmm(i,1,1,1).gt.IN_ZL .and. zbmm(i,1,1,1).lt.(IN_ZL*1.5)) 
+     &  wxz3(i,1,1,1)=wxz2(i,1,1,1)
+      enddo
+      call bottom_copy(wxz3,wo4)
+      rhsm_in = glsc2(wo4,bm1,n)/vol_in
+c     fix outlet
+C       do ez=1,lelz
+C       do ex=1,lelx
+C       do k=1,lz1
+C        do i=1,lx1
+C         if (zbmm(i,k,ex,ez).gt.(ZLEN-OUT_ZL)) then
+C          wxz2(i,k,ex,ez)=wxz2(i,izb2,ex,ezb2)*((-1.0/OUT_ZL)*
+C      &   (zbmm(i,k,ex,ez)-ZLEN+OUT_ZL)+1.0)
+C         endif 
+C        enddo
+C       enddo
+C       enddo
+C       enddo
+
+      do i=1,nxz
+       wxz2(i,1,1,1)=wxz2(i,1,1,1)*base_eta1(i,1,1,1)*base_eta2(i,1,1,1)
+        if (.not. IF_FAN) then
+        wxz2(i,1,1,1)=wxz2(i,1,1,1)+ (1.0-base_eta1(i,1,1,1))*rhsm_in
+        endif
+      enddo
+
+
+C       if (WDW_EXNER_RHS .ne. 0.0) call mean_filter(rhs,1)
+
+C       do i=1,nxz
+C       wxz2(i,1,1,1)=wxz2(i,1,1,1)*base_eta1(i,1,1,1)*base_eta2(i,1,1,1)
+C         if (.not. IF_FAN) then
+C         wxz2(i,1,1,1)=wxz2(i,1,1,1)+ (1.0-base_eta1(i,1,1,1))*
+C      &  wxz2(int(lx1/2),int(izb1),int(lelx/2),int(ezb1))+
+C      &  (1.0-base_eta2(i,1,1,1))*
+C      &  wxz2(int(lx1/2),int(izb2),int(lelx/2),int(ezb2))
+C         endif
+C       enddo
+
+
+      call bed_filter(wxz2, zbmm, xbmm,1) !removes element boundaries
+
+      do i=1,nxz
+        rhs(i,1,1,1)=wxz2(i,1,1,1)
+      enddo
+
+      do i=1,nxz
+       if (istep.ne.0) then
+         femm(i,1,1,1)=fem(i,1,1,1)
+         dtmm=dtm
+       endif 
+       fem(i,1,1,1)= wxz2(i,1,1,1)
+       dtm=abs(dt)
+       if (istep.eq.0) then
+        fem(i,1,1,1)=(2.0/3.0)*fem(i,1,1,1)
+        femm(i,1,1,1)=0.0
+        dtmm=dtm
+       endif
+       if (IF_EROS) then
+        if (istep.ne.0) then
+         femm_e(i,1,1,1)=fem_e(i,1,1,1)
+        endif 
+        fem_e(i,1,1,1)=cvd*abs(V_SETTLING*E_s(i,1,1,1))/(PACKING_FR)
+        fem_e(i,1,1,1)=fem_e(i,1,1,1)*base_eta1(i,1,1,1)
+     &  *base_eta2(i,1,1,1)
+        if (istep.eq.0) then
+         fem_e(i,1,1,1)=(2.0/3.0)*fem_e(i,1,1,1)
+         femm_e(i,1,1,1)=0.0
+        endif
+       endif !IF_EROS
+       if (IF_DEPO) then
+        if (istep.ne.0) then
+         femm_d(i,1,1,1)=fem_d(i,1,1,1)
+        endif 
+        fem_d(i,1,1,1)=V_SETTLING*B_eta(i,1,1,1)*btt(i,1,1,1)/PACKING_FR
+        fem_d(i,1,1,1)=fem_d(i,1,1,1)*base_eta1(i,1,1,1)*
+     &  base_eta2(i,1,1,1)
+        if (istep.eq.0) then
+         fem_d(i,1,1,1)=(2.0/3.0)*fem_d(i,1,1,1)
+         femm_d(i,1,1,1)=0.0
+        endif
+       endif !IF_DEPO
+       if (IF_DIVQ) then
+        if (istep.ne.0) then
+         femm_q(i,1,1,1)=fem_q(i,1,1,1)
+        endif 
+        fem_q(i,1,1,1)=(wxz1(i,1,1,1))/PACKING_FR
+        fem_q(i,1,1,1)=fem_q(i,1,1,1)*base_eta1(i,1,1,1)*
+     &  base_eta2(i,1,1,1)
+        if (istep.eq.0) then
+         fem_q(i,1,1,1)=(2.0/3.0)*fem_q(i,1,1,1)
+         femm_q(i,1,1,1)=0.0
+        endif
+       endif !IF_DIVQ
+      enddo
+
+      if (IF_DEPO) call A_Bashforth_2(eta_d,femm_d,fem_d,dtmm,dtm)
+      if (IF_EROS) call A_Bashforth_2(eta_e,femm_e,fem_e,dtmm,dtm)
+      if (IF_DIVQ) call A_Bashforth_2(eta_q,femm_q,fem_q,dtmm,dtm)
+      if (IF_DEPO) call bed_filter(eta_d, zbmm, xbmm,0)
+      if (IF_EROS) call bed_filter(eta_e, zbmm, xbmm,0)
+      if (IF_DIVQ) call bed_filter(eta_q, zbmm, xbmm,0)
+
+
+      call A_Bashforth_2(eta,femm,fem,dtmm,dtm)
+
+      if (if_write.eq.1) then        
+          open(unit=71,file=icfile,access='stream',form='unformatted')
+          write(71) int(lx1),int(lelx),int(lely),int(lelz)
+          if(IF_ALL_BED) then
+            write(71) int(1)
+          else
+            write(71) int(0)
+          endif
+          write(71) time
+          write(71) int_t
+          write(71) btt
+          write(71) eta
+          write(71) eta_d
+          write(71) eta_e
+          write(71) eta_q
+          if(IF_ALL_BED) then
+            write(71) E_s
+            write(71) sh_x
+            write(71) sh_z
+            write(71) sh_cr
+            write(71) qbxx
+            write(71) qbzz
+            write(71) theta_bedx
+            write(71) theta_bedz
+          endif
+          close(71)
+      endif
+
+      return
+      end
+
+      subroutine my_base_meshv(basev)
+      include 'SIZE'
+      include 'TOTAL'
+      real basev(lx1,ly1,lz1,lelv)
+      integer n,i
+      
+      n = nx1*ny1*nz1*nelv
+      call rzero(basev ,n)  ! basev  = 0
+      do i=1,n
+         y=ym1(i,1,1,1)
+         if (y.lt.hint) then
+          basev(i,1,1,1)=1.0
+         else 
+          basev(i,1,1,1) = -1.0*(y-hint)/(YLEN-hint)+1.0
+         endif
+      enddo
+
+      return
+      end
+
+      subroutine eta_mvmesh()
+
+      include 'SIZE'
+      include 'TOTAL'
+      include 'ZPER'
+      parameter (lt=lx1*ly1*lz1*lelv)
+
+      common /cmeshv/ basev(lt)   
+
+      common /eta_mvbc/ umeshx(lx1,ly1,lz1,lelv)
+     &              , umeshy(lx1,ly1,lz1,lelv)
+     &              , umeshz(lx1,ly1,lz1,lelv)
+     &              , rhs(lx1,lz1,lelx,lelz)
+
+      integer i, nxz, n,j,k
+      integer e,eg,ex,ey,ez
+
+      nxz=lx1*lz1*lelx*lelz
+      n = nx1*ny1*nz1*nelv
+
+      if (istep.eq.0) call my_base_meshv(basev)
+
+      call rzero(umeshy,n)
+      call bottom_copy(rhs,umeshy)
+
+      do i=1,n
+        umeshy(i,1,1,1)=umeshy(i,1,1,1)*basev(i)
+        wx(i,1,1,1)=0.0
+        wy(i,1,1,1)=umeshy(i,1,1,1)
+        wz(i,1,1,1)=0.0
+        umeshx(i,1,1,1) = wx(i,1,1,1)
+        umeshz(i,1,1,1) = wz(i,1,1,1)
+      enddo
+
+C         ifpo=.false.
+C         ifto=.false.
+C       if (mod(istep,10).eq.0) 
+C      &  call outpost2(wy,umeshy,wx,pr,t,0,'tes')
+
+C C         ifpo=.true.
+C         ifto=.true.
+
+
+      return
+      end
+      subroutine stress_normal(btuy,btwy,wxz1,
+     &                        thx,thz)
+
+      include 'SIZE'
+      include 'GEOM'
+      include 'PARALLEL'
+      include 'WZ'
+      include 'ZPER'
+
+
+      real btuy(lx1,lz1,lelx,lelz),btwy(lx1,lz1,lelx,lelz)
+      real wxz1(lx1,lz1,lelx,lelz)
+      real thx(lx1,lz1,lelx,lelz),thz(lx1,lz1,lelx,lelz)
+
+      common /v_filter/ vx_f(lx1,ly1,lz1,lelv),vy_f(lx1,ly1,lz1,lelv),
+     &                  vz_f(lx1,ly1,lz1,lelv),t_f(lx1,ly1,lz1,lelv)
+
+      integer nxz,e,eg,ex,ey,ez,i,j,k
+      real sn(3),normdum,dum
+      real vxx(lx1,ly1,lz1,lelv),
+     $     vxy(lx1,ly1,lz1,lelv),
+     $     vxz(lx1,ly1,lz1,lelv),
+     $     vzx(lx1,ly1,lz1,lelv),
+     $     vzy(lx1,ly1,lz1,lelv),
+     $     vzz(lx1,ly1,lz1,lelv)
+
+      nxz=lx1*lz1*lelx*lelz
+      call rzero(btuy,nxz)
+      call rzero(btwy,nxz)
+
+      do e=1,nelv
+           eg = lglel(e)
+           call get_exyz(ex,ey,ez,eg,nelx,nely,nelz)
+            do k=1,nz1
+              do j=1,ly1
+                  do i=1,nx1
+                   vx_f(i,j,k,e)=vx_f(i,j,k,e)*cos(thx(i,k,ex,ez))-
+     &                           vy_f(i,j,k,e)*sin(thx(i,k,ex,ez))
+                   vz_f(i,j,k,e)=vz_f(i,j,k,e)*cos(thz(i,k,ex,ez))-
+     &                           vy_f(i,j,k,e)*sin(thz(i,k,ex,ez))
+                  enddo
+                enddo
+             enddo
+      enddo
+
+c     compute gradients
+      call gradm1(vxx,vxy,vxz,vx_f)
+      call gradm1(vzx,vzy,vzz,vz_f)
+
+      do e=1,nelv
+           eg = lglel(e)
+           call get_exyz(ex,ey,ez,eg,nelx,nely,nelz)
+           if (ey.eq.1) then
+            j=1
+              do k=1,nz1
+                  do i=1,nx1
+                   sn(1)=sin(thx(i,k,ex,ez))*cos(thz(i,k,ex,ez))
+                   sn(2)=cos(thx(i,k,ex,ez))*cos(thz(i,k,ex,ez))
+                   sn(3)=cos(thx(i,k,ex,ez))*sin(thz(i,k,ex,ez))
+                   normdum=(sn(1)**2+sn(2)**2+sn(3)**2)**0.5
+                   sn(1)=sn(1)/normdum
+                   sn(2)=sn(2)/normdum
+                   sn(3)=sn(3)/normdum
+                   btuy(i,k,ex,ez)= vxx(i,j,k,e)*sn(1)+
+     &                  vxy(i,j,k,e)*sn(2)+vxz(i,j,k,e)*sn(3)
+                   btwy(i,k,ex,ez)= vzx(i,j,k,e)*sn(1)+
+     &                  vzy(i,j,k,e)*sn(2)+vzz(i,j,k,e)*sn(3)
+                  enddo
+                enddo
+           endif
+          enddo
+      call rzero(wxz1,size(wxz1))
+      call gop(btuy,wxz1,'+  ',nxz)
+      call rzero(wxz1,size(wxz1))
+      call gop(btwy,wxz1,'+  ',nxz)
+      return 
+      end
+
+
+      subroutine A_Bashforth_2(q,femm,fem,dtmm,dtm)
+
+      include 'SIZE'
+      include 'TOTAL'
+      include 'ZPER'
+
+      real q(lx1,lz1,lelx,lelz),
+     &     femm(lx1,lz1,lelx,lelz),
+     &     fem(lx1,lz1,lelx,lelz)
+
+     
+      real dtmm, dtm
+      integer n,i
+      real dummy
+      
+C       Performs the time integration of quantity q, using a multistep
+C       Adams-Basforth 2nd order scheme, with variable step size.
+C       y_k=y_(k-1)+h_k*(f_(k-1)+0.5*(h_k/h_(k-1))*(f_(k-1)-f_(k-2))) 
+C       femm <-- f_(k-2) ; fem <-- f_(k-1)
+C       dtm <-- h_k=t_k-t_(k-1); dtmm <-- h_(k-1)=t_(k-1)-t_(k-2)
+
+      n=lx1*lz1*lelx*lelz
+
+      do i=1,n
+       dummy=fem(i,1,1,1)+0.5*(dtm/dtmm)*(fem(i,1,1,1)-femm(i,1,1,1))
+       dummy=dummy*dtm
+       q(i,1,1,1)=q(i,1,1,1)+dummy
+      enddo
+
+      return
+      end
+      
+      subroutine gaussian_filter_setup(z,x,std_z,std_x,kernelz,
+     & kernelx,mask_gf)
+
+      include 'SIZE'
+      include 'TOTAL'
+      include 'ZPER'
+
+      real z(lx1,lz1,lelx,lelz),x(lx1,lz1,lelx,lelz)
+      real std_x,std_z
+
+      parameter (lx1tp=2*lx1+1)
+      real kernelx(lx1,lx1tp),
+     & kernelz(lx1,lx1tp)
+      integer mask_gf(lx1,lx1tp,2)
+     
+
+      real delx(lx1),delz(lx1), deltx(lx1,2*lx1+1), deltz(lx1,2*lx1+1)
+      real ksx,ksz,dumm, del_x, del_z
+      integer i,j,k,nxz
+      integer ip, el
+      nxz=lx1*lz1*lelx*lelz
+
+      do i =1,lx1-1
+        delx(i)=x(i+1,1,1,1)-x(i,1,1,1)
+      enddo
+      delx(lx1)=0.0
+      do i =1,lz1-1
+        delz(i)=z(1,i+1,1,1)-z(1,i,1,1)
+      enddo
+
+      if (nid.eq.0) then 
+        write(*,*) 'Gaussian filter setup..................'
+        write(*,*) 'Element size in x:',x(lx1,1,1,1), 'sigma_x:',std_x
+        write(*,*) 'Element size in z:',z(1,lx1,1,1), 'sigma_z:',std_z
+      endif
+
+      do i=1,lx1
+        deltx(i,lx1+1)=0.0
+        deltz(i,lx1+1)=0.0
+        mask_gf(i,lx1+1,1)=i
+        mask_gf(i,lx1+1,2)=0
+
+        del_x=0.0
+        del_z=0.0
+        do k=lx1+2,lx1tp
+         ip=i+k-lx1-1
+         el=0
+         if (ip.gt.lx1) then
+           ip=ip-lx1
+           el=1
+         endif
+         del_x=del_x+delx(ip-1)
+         deltx(i,k)=del_x
+         del_z=del_z+delz(ip-1)
+         deltz(i,k)=del_z
+         mask_gf(i,k,1)=ip
+         mask_gf(i,k,2)=el
+        enddo
+        del_x=0.0
+        del_z=0.0
+        do k=lx1,1,-1
+          ip=i+k-lx1-1
+          el=0
+          if (ip.lt.1) then
+           ip=ip+lx1
+           el=-1
+          endif
+          del_x=del_x-delx(ip)
+          deltx(i,k)=del_x
+          del_z=del_z-delz(ip)
+          deltz(i,k)=del_z
+          mask_gf(i,k,1)=ip
+          mask_gf(i,k,2)=el
+        enddo
+        ksx=0.0
+        ksz=0.0
+        do k=1,lx1tp
+         dumm=-1.0*(deltx(i,k)**2)/(2.0*std_x**2)
+         kernelx(i,k)=exp(dumm)
+         if (mask_gf(i,k,1).eq.lx1) kernelx(i,k)=0.0
+         ksx=ksx+kernelx(i,k)
+         dumm=-1.0*(deltz(i,k)**2)/(2.0*std_z**2)
+         kernelz(i,k)=exp(dumm)
+         if (mask_gf(i,k,1).eq.lx1) kernelz(i,k)=0.0
+         ksz=ksz+kernelz(i,k)
+        enddo
+        do k=1,lx1tp
+          kernelx(i,k)=kernelx(i,k)/ksx
+          kernelz(i,k)=kernelz(i,k)/ksz
+        enddo
+      enddo
+
+      return
+      end
+
+
+      subroutine gaussian_filter(q,kernelz, kernelx,mask_gf)
+
+      include 'SIZE'
+      include 'TOTAL'
+      include 'ZPER'
+C       Beware with edge boundaries, node lx1 = 0!!
+
+      real q(lx1,lz1,lelx,lelz)
+      parameter (lx1tp=2*lx1+1)
+      real kernelx(lx1,lx1tp), kernelz(lx1,lx1tp)
+      integer mask_gf(lx1,lx1tp,2)
+
+      integer i,j,k,ex,ez,nxz, im,em
+      real wq(lx1,lz1,lelx,lelz)
+      real dumm1,dumm2
+      nxz=lx1*lz1*lelx*lelz
+
+      call rzero(wq,nxz)
+C       first x
+      do ez=1,lelz
+        do ex=1,lelx
+          do j=1,lz1
+            do i=1,lx1
+              dumm1=q(i,j,ex,ez)
+              do k=1,lx1tp
+               im=mask_gf(i,k,1)
+               em=mask_gf(i,k,2)
+               if (ex.eq.lelx .and. em.ge.1) then
+                if (IF_FAN) then
+                  cycle !I'm ignoring some bad edge behavior here, I'll fix it some day
+                else
+                  wq(im,j,em,ez)=wq(im,j,em,ez)+dumm1*kernelx(i,k)
+                 endif
+                elseif (ex.eq.1 .and. em.lt.0) then
+                 if (IF_FAN) then
+                   cycle
+                 else
+                   wq(im,j,lelx+1+em,ez)=wq(im,j,lelx+1+em,ez)  !if em=-1, ex=lelx
+     &                                   +dumm1*kernelx(i,k)
+                 endif
+                else
+                  wq(im,j,ex+em,ez)=wq(im,j,ex+em,ez)+dumm1*kernelx(i,k)
+               endif
+              enddo
+            enddo
+          enddo
+        enddo
+      enddo
+
+C       now z
+      call rzero(q,nxz)
+
+      do ez=1,lelz
+        do ex=1,lelx
+          do j=1,lz1
+            do i=1,lx1
+              dumm1=wq(i,j,ex,ez)
+              do k=1,lx1tp
+               im=mask_gf(j,k,1)
+               em=mask_gf(j,k,2)
+               if (ez.eq.lelz .and. em.ge.1) then
+                  cycle
+               elseif (ez.eq.1 .and. em.lt.0) then
+                  cycle
+               else
+                  q(i,im,ex,ez+em)=q(i,im,ex,ez+em)+dumm1*kernelz(j,k)
+               endif
+              enddo
+            enddo
+          enddo
+        enddo
+      enddo
+
+      return
+      end
+
+

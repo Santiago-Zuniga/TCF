@@ -1,0 +1,14 @@
+base.rea
+-3                         spatial dimension (if negative dump .re2 file)
+1                          number of fields
+#
+#=======================================================================
+#
+# box file for FRONT set of routines.
+# bc's shouldn't be tamperered with, the .usr file deals with them.
+box_1
+-11 -9 -14                     nelx,nely,nelz (negative --> auto spacing)
+0.0 1.0 1.0                  x_0  x_1 ratio
+0.0 1.0 1.0		             y_0  y_1 ratio
+0.0 1.0 1.0                  z_0  z_1 ratio
+P  ,P  ,W  ,SYM,P  ,P  ,     bc's  ! west,east,south,north,bottom,top

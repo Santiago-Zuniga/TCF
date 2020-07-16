@@ -1,0 +1,70 @@
+#
+# nek parameter file for Spatially Evolving TCs
+#
+
+[GENERAL]
+
+startFrom = turbChannel0.ini time=0
+
+#stopAt = endTime
+#endTime = 4.2
+stopAt = numSteps
+numSteps = 1000
+
+dt = 3.0e-4
+timeStepper = bdf3
+#extrapolation = OIFS
+#variableDt = no
+#targetCFL = 2.5
+
+#writeControl = runTime
+writeControl = timeStep
+writeInterval = 100
+
+filtering = none
+#filtering = explicit
+#filterWeight = 0.95
+#filterModes=3
+#filterCutoffRatio = 0.65
+
+# Simulation parameters ----------------------------------------
+userParam01 = 0         # Ri_tau
+userParam03 = 0.0       # Settling velocity, absolute value
+userParam04 = 0.0       # Nondimensional particle diameter
+userParam06 = 0         # Bottom concentration BC. 0->depositional 1->bypass 2->Erosion
+userParam07 = 2.0       # x lenght / pi
+userParam08 = 1.0       # y lenght (height)
+userParam09 = 4.0       # z lenght / pi
+
+# I/O parameters ---------------------------------------------
+userParam11 = 0         # whether to read inflow2d.ini (2d) for restasting
+userParam12 = 0         # whether to read bedform.ini for restasting
+userParam13 = 999999    # output frequency for spanwise-time-averaged statistics. If <0, means.ini will be read for restarting
+userParam14 = 999999    # step for which means over time will start being accumated. If <0, means will only be spanwise-averaged.
+userParam15 = 999999    # output frequency for spanwise-averaged vel-temp file
+userParam16 = -1       # output frequency for bedform file. If 0 or less, bedform calculations won't be done
+
+
+[MESH]
+numberOfBCFields = 1
+writeToFieldFile = yes
+
+
+[PROBLEMTYPE]
+#variableProperties = yes
+equation = incompNS
+
+[PRESSURE]
+#preconditioner = semg_amg
+residualTol = 1e-4 
+writeToFieldFile = no
+
+[VELOCITY]
+residualTol = 1e-6 
+density = 1.
+viscosity = -180
+
+#[TEMPERATURE]
+#rhoCp = 1.
+#conductivity = -180
+#residualTol = 1e-6 
