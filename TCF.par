@@ -1,15 +1,15 @@
 #
-# nek parameter file for Spatially Evolving TCs
+# nek parameter file for Turbulent Channel Flows (TCF)
 #
 
 [GENERAL]
 
 startFrom = turbChannel0.ini time=0
 
-#stopAt = endTime
-#endTime = 4.2
-stopAt = numSteps
-numSteps = 1000
+stopAt = endTime
+endTime = 100
+#stopAt = numSteps
+#numSteps = 1000
 
 dt = 3.0e-4
 timeStepper = bdf3
