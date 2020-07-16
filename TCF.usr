@@ -1895,57 +1895,6 @@ C           now x
         mvs=3
       endif
 
-      if (istep.eq.0) then
-      call rzero(rhs,size(rhs))
-        zbu(1) = IN_ZL
-        zbu(2) = OUT_ZL
-      do i=1,nxz
-       base_eta1(i,1,1,1)=1.0
-       base_eta2(i,1,1,1)=1.0
-       if (zbmm(i,1,1,1).le.zbu(1)) then 
-        base_eta1(i,1,1,1)=zbmm(i,1,1,1)/zbu(1)
-        base_eta1(i,1,1,1)=base_eta1(i,1,1,1)**2.0
-       endif
-       if (zbmm(i,1,1,1).gt.(ZLEN-zbu(2))) then
-        base_eta2(i,1,1,1)=(-1.0/zbu(2))*(zbmm(i,1,1,1)-ZLEN
-     &                   +zbu(2))+1.0
-        base_eta2(i,1,1,1)=base_eta2(i,1,1,1)**2.0
-       endif
-      enddo
-      vol_in=0.0
-      dumm=0.0
-      do e=1,nelv
-       eg = lglel(e)
-         call get_exyz(ex,ey,ez,eg,nelx,nely,nelz)
-          do k=1,nz1
-            do j=1,ly1
-                do i=1,nx1
-                  if (zbmm(i,k,ex,ez).gt.IN_ZL .and. 
-     &                zbmm(i,k,ex,ez) .lt. (IN_ZL*1.5)) then
-                    vol_in=vol_in+bm1(i,j,k,e)
-                  endif
-                enddo
-              enddo
-           enddo
-      enddo
-      call gop(vol_in,dumm,'+  ',1)
-
-      do ez=1,lelz
-       do i=1,lz1
-        izb2 = i
-        ezb2 = ez
-        if (zbmm(1,i,1,ez).gt.(ZLEN-zbu(2))) exit 
-       enddo
-      enddo
-      do ez=1,lelz
-       do i=1,lz1
-        izb1 = i
-        ezb1 = ez
-        if (zbmm(1,i,1,ez).gt.(zbu(1))) exit 
-       enddo
-      enddo
-
-      endif !istep.eq.0
 
       if (istep.eq.0) counter_bed=0
       if_write=0
@@ -2031,48 +1980,6 @@ C       call q_integral_s(q_integral,qbz,qbx,wo1,wo2,igs_x,igs_z)
      &               -wxz1(i,1,1,1)) ! div.q
         wxz2(i,1,1,1)=wxz2(i,1,1,1)/PACKING_FR
       enddo
-
-C     fix inlet
-      do i=1,nxz
-        wxz3(i,1,1,1)=0.0
-        if (zbmm(i,1,1,1).gt.IN_ZL .and. zbmm(i,1,1,1).lt.(IN_ZL*1.5)) 
-     &  wxz3(i,1,1,1)=wxz2(i,1,1,1)
-      enddo
-      call bottom_copy(wxz3,wo4)
-      rhsm_in = glsc2(wo4,bm1,n)/vol_in
-c     fix outlet
-C       do ez=1,lelz
-C       do ex=1,lelx
-C       do k=1,lz1
-C        do i=1,lx1
-C         if (zbmm(i,k,ex,ez).gt.(ZLEN-OUT_ZL)) then
-C          wxz2(i,k,ex,ez)=wxz2(i,izb2,ex,ezb2)*((-1.0/OUT_ZL)*
-C      &   (zbmm(i,k,ex,ez)-ZLEN+OUT_ZL)+1.0)
-C         endif 
-C        enddo
-C       enddo
-C       enddo
-C       enddo
-
-      do i=1,nxz
-       wxz2(i,1,1,1)=wxz2(i,1,1,1)*base_eta1(i,1,1,1)*base_eta2(i,1,1,1)
-        if (.not. IF_FAN) then
-        wxz2(i,1,1,1)=wxz2(i,1,1,1)+ (1.0-base_eta1(i,1,1,1))*rhsm_in
-        endif
-      enddo
-
-
-C       if (WDW_EXNER_RHS .ne. 0.0) call mean_filter(rhs,1)
-
-C       do i=1,nxz
-C       wxz2(i,1,1,1)=wxz2(i,1,1,1)*base_eta1(i,1,1,1)*base_eta2(i,1,1,1)
-C         if (.not. IF_FAN) then
-C         wxz2(i,1,1,1)=wxz2(i,1,1,1)+ (1.0-base_eta1(i,1,1,1))*
-C      &  wxz2(int(lx1/2),int(izb1),int(lelx/2),int(ezb1))+
-C      &  (1.0-base_eta2(i,1,1,1))*
-C      &  wxz2(int(lx1/2),int(izb2),int(lelx/2),int(ezb2))
-C         endif
-C       enddo
 
 
       call bed_filter(wxz2, zbmm, xbmm,1) !removes element boundaries
